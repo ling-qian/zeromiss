@@ -77,3 +77,4 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
+config/knowledge_base_data.json
