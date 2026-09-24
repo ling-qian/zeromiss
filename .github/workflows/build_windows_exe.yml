@@ -89,6 +89,16 @@ jobs:
           [ "$OK" = "1" ] || { echo "启动后 API 未就绪"; exit 1; }
           echo "✓ macOS 冒烟通过"
 
+      - name: Ad-hoc 签名（免费；2026新规：无签名结构的可执行文件会被Gatekeeper判"已损坏"）
+        run: |
+          codesign --force --deep --sign - "dist/美业AI店长助手" 2>/dev/null || \
+          find dist -name "*.app" -exec codesign --force --deep --sign - {} \; || true
+
+      - name: 制作 .dmg 安装镜像
+        run: |
+          hdiutil create -volname "BizBot AI店长助手" -srcfolder "dist/美业AI店长助手" -ov -format UDZO BizBot-macos.dmg
+          ls -lh BizBot-macos.dmg
+
       - name: 压缩产物（含双击启动器）
         run: |
           cp deploy/启动店长助手.command "dist/美业AI店长助手/启动店长助手.command" || true
@@ -98,5 +108,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: BizBot-macos
-          path: BizBot-macos.zip
+          path: |
+            BizBot-macos.dmg
+            BizBot-macos.zip
           retention-days: 30
