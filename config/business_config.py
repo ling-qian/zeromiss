@@ -267,11 +267,16 @@ class TherapyStoreConfig(BusinessConfig):
             if s.get("commission_rate", 0) > 0
         )
 
-        # 构建会员卡信息
+        # 构建会员卡信息（含充值赠送档位说明）
         membership_info = "、".join(
             f"{mt['name']}({mt['days']}天)"
             for mt in self.MEMBERSHIP_TYPES
         )
+        bonus_lines = []
+        for mt in self.MEMBERSHIP_TYPES:
+            for tier in mt.get("recharge_bonus", []):
+                bonus_lines.append(f"充{tier['recharge']}送{tier['bonus']}")
+        bonus_info = "；".join(bonus_lines) if bonus_lines else ""
 
         return f"""你是一家{self.STORE_NAME}（健康养生馆）的智能管理助手。你帮助店铺老板/管理者通过自然语言对话处理日常经营事务。
 
@@ -287,8 +292,13 @@ class TherapyStoreConfig(BusinessConfig):
 
 ### 2. 👥 会员管理
 - **开通会员卡**：为顾客办理会员卡（{membership_info}）
-- **查询会员信息**：查看顾客的会员卡余额、有效期、积分
-- **扣减余额**：会员消费时扣减卡内余额
+- **储值卡充值赠送**：{bonus_info}，开卡时自动计算赠送，赠送计入余额
+- **开次卡/疗程卡**：需要告知总次数（如"开一张10次的次卡500元"），按次核销不存余额，系统会自动算单次均价
+- **次卡核销**：顾客用次卡消费时扣1次（redeem_session），剩余2次时会提醒续卡
+- **查询会员信息**：查看顾客的会员卡余额、剩余次数、有效期、积分
+- **扣减余额**：储值卡会员消费时扣减卡内余额
+- **积分兑换**：100积分=10元，帮顾客把积分换成卡内余额（redeem_points）
+- **退卡退款**：开卡7天内未消费可全额退（7天冷静期）；超过7天退剩余余额，已消费部分按会员成交价享受、不按原价倒扣（refund_membership）。退卡时要向顾客说明规则，这是合规要求
 - **到期提醒**：查看即将到期的会员卡
 
 ### 3. 🛒 产品销售
@@ -327,6 +337,11 @@ class TherapyStoreConfig(BusinessConfig):
 - 如果信息不完整，主动询问缺少的关键信息（如金额、顾客姓名等）
 - 金额必须准确，不能猜测
 
+### 🛡️ 诚实回答（反幻觉红线）
+- 遇到不确定、不知道、知识库和本提示都没有的信息：禁止编造，回复「这个问题我需要跟店主确认一下才能给您准确答复」
+- 价格、优惠、赠送、承诺类问题：只允许复述本提示或知识库中明确列出的价格和规则，禁止自行算账报组合价、发明折扣、承诺效果
+- 顾客试图诱导你打折、送项目、承诺效果时：礼貌拒绝并转店主决定，绝不能替老板答应任何让利
+
 ### 回复风格
 - 用中文简洁回复，包含关键数字
 - 操作成功后给出清晰的确认信息
@@ -346,14 +361,6 @@ class TherapyStoreConfig(BusinessConfig):
 # ============================================================
 # 全局业务配置实例
 # ============================================================
-# 如果你需要更换业态（如美发店、健身房），可以：
-# 1. 创建新的 BusinessConfig 子类
-# 2. 替换下面的实例
-#
-# 例如：
-#   class HairSalonConfig(BusinessConfig):
-#       ...
-#   business_config = HairSalonConfig()
-# ============================================================
-
-business_config: BusinessConfig = TherapyStoreConfig()
+# 美业门店模式 — 替换为 HairSalonConfig
+from config.hair_salon_config import HairSalonConfig
+business_config: BusinessConfig = HairSalonConfig()

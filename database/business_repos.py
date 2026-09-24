@@ -19,7 +19,7 @@ from .entity_repos import (
 )
 from .models import (
     ServiceRecord, ProductSale, Membership,
-    InventoryLog, Customer
+    InventoryLog, Customer, Appointment
 )
 
 
@@ -404,8 +404,12 @@ class MembershipRepository(BaseCRUD):
                 customer_id=customer.id,
                 card_type=membership_data.get("card_type", "储值卡"),
                 total_amount=membership_data.get("amount", 0),
-                balance=membership_data.get("amount", 0),
+                # 允许显式指定余额（如储值卡充值赠送后到账金额），默认等于充值金额
+                balance=membership_data.get(
+                    "balance", membership_data.get("amount", 0)
+                ),
                 remaining_sessions=membership_data.get("remaining_sessions"),
+                extra_data=membership_data.get("extra_data", {}),
                 opened_at=opened_at,
                 expires_at=expires_at
             )
@@ -547,3 +551,135 @@ class MembershipRepository(BaseCRUD):
                 Membership.id == mid
             ).first()
 
+class AppointmentRepository(BaseCRUD):
+    """预约记录仓库。
+
+    管理顾客预约的创建、查询和状态流转，让AI的口头预约真正落库。
+    """
+
+    def __init__(self, conn: DatabaseConnection) -> None:
+        super().__init__(conn)
+
+    def create_appointment(
+        self,
+        customer_name: str,
+        service_name: str,
+        appointment_date: date,
+        appointment_time: Optional[str] = None,
+        phone: Optional[str] = None,
+        customer_id: Optional[int] = None,
+        notes: Optional[str] = None,
+        session: Optional[Session] = None,
+    ) -> Appointment:
+        """创建预约记录。
+
+        Args:
+            customer_name: 顾客姓名（必填）。
+            service_name: 预约的服务项目（必填）。
+            appointment_date: 预约日期（必填）。
+            appointment_time: 预约时间，如"14:30"（可选）。
+            phone: 联系电话（可选）。
+            customer_id: 已建档顾客ID（可选）。
+            notes: 备注（可选）。
+            session: 外部会话（可选）。
+        """
+        with self._get_session() as sess:
+            appt = Appointment(
+                customer_name=str(customer_name).strip(),
+                service_name=str(service_name).strip(),
+                appointment_date=appointment_date,
+                appointment_time=(str(appointment_time).strip() if appointment_time else None),
+                phone=phone,
+                customer_id=customer_id,
+                notes=notes,
+                status="pending",
+            )
+            # 尝试关联已建档顾客
+            if customer_id is None:
+                existing = sess.query(Customer).filter(
+                    Customer.name == appt.customer_name
+                ).first()
+                if existing:
+                    appt.customer_id = existing.id
+                    if existing.phone and not appt.phone:
+                        appt.phone = existing.phone
+            sess.add(appt)
+            sess.commit()
+            sess.refresh(appt)
+            return appt
+
+    def list_appointments(
+        self,
+        target_date: Optional[date] = None,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        status: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Appointment]:
+        """查询预约列表。
+
+        Args:
+            target_date: 按单日查询（与start/end互斥使用）。
+            start_date: 起始日期（含）。
+            end_date: 结束日期（含）。
+            status: 按状态过滤（pending/confirmed/completed/cancelled/no_show）。
+            limit: 返回上限，默认100。
+        """
+        with self._get_session() as sess:
+            q = sess.query(Appointment)
+            if target_date is not None:
+                q = q.filter(Appointment.appointment_date == target_date)
+            else:
+                if start_date is not None:
+                    q = q.filter(Appointment.appointment_date >= start_date)
+                if end_date is not None:
+                    q = q.filter(Appointment.appointment_date <= end_date)
+            if status:
+                q = q.filter(Appointment.status == status)
+            return (
+                q.order_by(Appointment.appointment_date.asc(),
+                           Appointment.created_at.asc())
+                .limit(limit).all()
+            )
+
+    # 预约状态机：合法流转表（终态不可回退）
+    APPT_VALID_TRANSITIONS = {
+        "pending": {"confirmed", "completed", "cancelled", "no_show"},
+        "confirmed": {"completed", "cancelled", "no_show"},
+        "completed": set(),   # 终态
+        "cancelled": set(),   # 终态
+        "no_show": set(),     # 终态
+    }
+
+    def update_status(self, appointment_id: int, new_status: str) -> Optional[Appointment]:
+        """更新预约状态（带状态机校验）。
+
+        合法流转：pending→confirmed/completed/cancelled/no_show；
+        confirmed→completed/cancelled/no_show；终态不可回退。
+
+        Args:
+            appointment_id: 预约ID。
+            new_status: 新状态（pending/confirmed/completed/cancelled/no_show）。
+
+        Raises:
+            ValueError: 状态名不合法，或违反状态机流转规则。
+        """
+        valid = {"pending", "confirmed", "completed", "cancelled", "no_show"}
+        if new_status not in valid:
+            raise ValueError(f"状态不合法: {new_status}，可选: {sorted(valid)}")
+        with self._get_session() as sess:
+            appt = sess.query(Appointment).filter(
+                Appointment.id == appointment_id
+            ).first()
+            if appt:
+                allowed = self.APPT_VALID_TRANSITIONS.get(appt.status, set())
+                if new_status not in allowed:
+                    raise ValueError(
+                        f"状态流转不合法: {appt.status}({appt.id}号预约) "
+                        f"不能改为 {new_status}，"
+                        f"当前状态允许: {sorted(allowed) if allowed else '已终态'}"
+                    )
+                appt.status = new_status
+                sess.commit()
+                sess.refresh(appt)
+            return appt

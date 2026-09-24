@@ -43,13 +43,13 @@ def _next_op_id() -> str:
 
 
 def _parse_date(date_str: Optional[str] = None) -> date:
-    """解析日期字符串，默认今天。"""
+    """解析日期字符串，默认今天。格式非法时抛 ValueError（由调用方转成 error 返回给 AI 自我纠正）。"""
     if not date_str:
         return date.today()
     try:
         return datetime.strptime(date_str, "%Y-%m-%d").date()
     except ValueError:
-        return date.today()
+        raise ValueError(f"日期格式不合法：「{date_str}」，请使用 YYYY-MM-DD 格式（如 2026-09-15）")
 
 
 # ================================================================
@@ -82,6 +82,14 @@ def record_service(
     """
     db = _get_db()
     try:
+        # 🚫 金额校验
+        if not isinstance(amount, (int, float)) or amount <= 0:
+            return {"success": False, "error": f"⚠️ 服务金额必须大于0，当前值: {amount}"}
+        # 🚫 顾客名非空校验
+        if not customer_name or not str(customer_name).strip():
+            return {"success": False, "error": "⚠️ 顾客姓名不能为空，请提供顾客姓名"}
+        customer_name = str(customer_name).strip()
+
         service_date = _parse_date(date_str)
 
         # 查找员工和提成
@@ -255,14 +263,20 @@ def open_membership(
     customer_name: str,
     card_type: str,
     amount: float,
+    sessions: Optional[int] = None,
     date_str: Optional[str] = None,
 ) -> dict:
-    """为顾客开通会员卡/疗程卡。
+    """为顾客开通会员卡/疗程卡/储值卡/次卡。
+
+    - 储值卡：自动匹配充值赠送档位（配置 recharge_bonus），赠送计入余额
+    - 次卡：需传 sessions（总次数），按次核销，不存余额
+    - 其他卡型：充值金额即余额
 
     Args:
         customer_name: 顾客姓名（必填）
-        card_type: 卡类型，如"年卡"、"季卡"、"月卡"、"次卡"、"疗程卡"（必填）
-        amount: 充值金额（必填）
+        card_type: 卡类型，如"年卡"、"季卡"、"月卡"、"次卡"、"疗程卡"、"储值卡"（必填）
+        amount: 充值/购卡金额（必填）
+        sessions: 次卡总次数，仅次卡/疗程卡需要（可选）
         date_str: 开卡日期，格式YYYY-MM-DD，默认今天（可选）
 
     Returns:
@@ -271,10 +285,49 @@ def open_membership(
     db = _get_db()
     try:
         from database.models import Membership
+        # 顾客名非空校验：空名/纯空格会创建无主卡，后续无法核销和召回
+        if not customer_name or not str(customer_name).strip():
+            return {"success": False, "error": "顾客姓名不能为空，请提供顾客姓名"}
+        customer_name = str(customer_name).strip()
         opened_date = _parse_date(date_str)
 
-        days_map = {"年卡": 365, "季卡": 90, "月卡": 30, "次卡": 365, "疗程卡": 180, "储值卡": 365}
-        days = days_map.get(card_type, 365)
+        # 卡型有效期/积分比例统一由 config.MEMBERSHIP_TYPES 驱动，避免配置与执行两张皮
+        from config.business_config import business_config
+        card_cfg = {c["name"]: c for c in business_config.get_membership_types()}
+        # 卡型白名单校验：不存在的卡型直接拒绝（防止AI识别错误开出奇怪卡型）
+        valid_cards = set(card_cfg.keys()) | {"疗程卡"}
+        if card_type not in valid_cards:
+            names = "、".join(sorted(valid_cards))
+            return {
+                "success": False,
+                "error": f"暂不支持「{card_type}」，当前支持的卡型：{names}。如需新卡型请先在业务配置中添加",
+            }
+        cfg = card_cfg.get(card_type, {})
+        days = cfg.get("days", 180 if card_type == "疗程卡" else 365)
+        points_per_yuan = cfg.get("points_per_yuan", 0.1)
+        points = int(amount * points_per_yuan)
+
+        # 次卡校验：必须指定次数，余额为0（次卡按次核销，不存钱）
+        if not isinstance(amount, (int, float)) or amount <= 0:
+            return {"success": False, "error": "开卡金额必须大于0"}
+        is_session_card = card_type in ("次卡", "疗程卡")
+        if is_session_card:
+            if not isinstance(sessions, int) or sessions <= 0:
+                return {
+                    "success": False,
+                    "error": "开次卡/疗程卡需要指定总次数（sessions），例如：给张姐开一张10次的洗剪次卡500元",
+                }
+            if amount <= 0:
+                return {"success": False, "error": f"购卡金额必须大于0，收到：{amount}"}
+            balance = 0.0
+            per_use = round(amount / sessions, 2)
+        else:
+            # 储值卡充值赠送：匹配最高适用档位，赠送计入余额
+            bonus = 0.0
+            for tier in cfg.get("recharge_bonus", []):
+                if amount >= tier["recharge"]:
+                    bonus = float(tier["bonus"])
+            balance = float(amount) + bonus
 
         msg_id = db.save_raw_message({
             "msg_id": f"agent_mem_{datetime.now().timestamp()}",
@@ -288,29 +341,46 @@ def open_membership(
             "card_type": card_type,
             "date": opened_date,
             "amount": amount,
+            "balance": balance,
+            "remaining_sessions": sessions if is_session_card else None,
+            "expires_at": str(opened_date + timedelta(days=days)),
+            # 次卡记录总次数，退卡时按剩余比例折算退款
+            "extra_data": {"total_sessions": sessions} if is_session_card else {},
         }, msg_id)
 
-        # 设置有效期和积分
+        # 设置积分（有效期已在save时写入）
         with db.get_session() as session:
             membership = session.query(Membership).filter(
                 Membership.id == membership_id
             ).first()
             if membership:
-                membership.expires_at = opened_date + timedelta(days=days)
-                membership.points = int(amount / 10)
+                membership.points = points
                 session.commit()
 
-        return {
+        result = {
             "success": True,
-            "message": f"✅ 已为{customer_name}开通{card_type}，充值{amount}元",
             "membership_id": membership_id,
             "customer": customer_name,
             "card_type": card_type,
             "amount": amount,
             "valid_days": days,
             "expires_at": str(opened_date + timedelta(days=days)),
-            "points": int(amount / 10),
+            "points": points,
         }
+        if is_session_card:
+            result["message"] = (
+                f"✅ 已为{customer_name}开通{card_type}：{sessions}次，购卡{amount}元"
+                f"（单次合{per_use}元），有效期{days}天"
+            )
+            result["total_sessions"] = sessions
+            result["per_use_price"] = per_use
+        else:
+            result["message"] = f"✅ 已为{customer_name}开通{card_type}，充值{amount}元"
+            result["balance"] = balance
+            if bonus > 0:
+                result["message"] += f"，赠送{bonus:g}元，到账余额{balance:g}元"
+                result["bonus"] = bonus
+        return result
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -438,6 +508,211 @@ def deduct_membership_balance(
         return {"success": False, "error": str(e)}
 
 
+def redeem_session(membership_id: int, service_name: Optional[str] = None) -> dict:
+    """次卡/疗程卡核销：扣减1次剩余次数。
+
+    Args:
+        membership_id: 会员卡ID（必填）
+        service_name: 本次使用的服务名称（可选，仅用于记录备注）
+
+    Returns:
+        操作结果，含剩余次数
+    """
+    db = _get_db()
+    try:
+        from database.models import Membership
+        with db.get_session() as session:
+            m = session.query(Membership).filter(Membership.id == membership_id).first()
+            if not m:
+                return {"success": False, "error": f"找不到会员卡 #{membership_id}"}
+            if m.remaining_sessions is None:
+                return {
+                    "success": False,
+                    "error": f"会员卡 #{membership_id}（{m.card_type}）不是次卡，不能用扣次，请用扣减余额",
+                }
+            if m.remaining_sessions <= 0:
+                return {
+                    "success": False,
+                    "error": f"会员卡 #{membership_id} 次数已用完，请提示顾客续卡或升级",
+                }
+            if not m.is_active:
+                return {"success": False, "error": f"会员卡 #{membership_id} 已过期或停用"}
+            # 自然过期校验：is_active 为真但已过有效期，同样不能核销
+            if m.expires_at and m.expires_at < date.today():
+                return {"success": False, "error": f"会员卡 #{membership_id} 已于 {m.expires_at} 到期，无法核销，请提示顾客续卡"}
+            m.remaining_sessions -= 1
+            remaining = m.remaining_sessions
+            session.commit()
+
+        svc = f"（{service_name}）" if service_name else ""
+        msg = f"✅ 已核销会员卡 #{membership_id}{svc} 1次，剩余 {remaining} 次"
+        if remaining <= 2:
+            msg += f"，⚠️ 次数不多，记得提醒顾客续卡"
+        return {
+            "success": True,
+            "message": msg,
+            "remaining_sessions": remaining,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def refund_membership(membership_id: int, reason: Optional[str] = None) -> dict:
+    """会员卡退卡退款（符合预付式消费合规要求）。
+
+    规则（依据最高法预付式消费司法解释）：
+    - 开卡7天内且未产生任何消费（余额未动）：全额退款（7天冷静期）
+    - 超过7天：退剩余余额，已消费部分按会员成交价享受，不按原价倒扣
+
+    Args:
+        membership_id: 会员卡ID（必填）
+        reason: 退卡原因（可选，仅记录）
+
+    Returns:
+        操作结果，含退款金额与规则说明
+    """
+    db = _get_db()
+    try:
+        from database.models import Membership, ServiceRecord
+        with db.get_session() as session:
+            m = session.query(Membership).filter(Membership.id == membership_id).first()
+            if not m:
+                return {"success": False, "error": f"找不到会员卡 #{membership_id}"}
+            if not m.is_active:
+                return {"success": False, "error": f"会员卡 #{membership_id} 已失效，无需退卡"}
+            if m.remaining_sessions is not None:
+                # 次卡/疗程卡退款：按剩余次数占开卡总次数比例折算
+                total_sessions = (m.extra_data or {}).get("total_sessions")
+                if isinstance(total_sessions, (int, float)) and total_sessions > 0:
+                    remaining = max(int(m.remaining_sessions), 0)
+                    opened = m.opened_at
+                    within_cooldown = (date.today() - opened).days <= 7 and remaining == int(total_sessions)
+                    if within_cooldown:
+                        refund_amount = float(m.total_amount)
+                        rule = f"7天冷静期内未核销，全额退款"
+                    else:
+                        refund_amount = round(float(m.total_amount) * remaining / total_sessions, 2)
+                        if remaining == 0:
+                            rule = "次数已用完，无可退金额，仅办理退卡"
+                        else:
+                            rule = f"按剩余 {remaining}/{int(total_sessions)} 次折算退款（已核销部分不退）"
+                    # 统一状态清理：退卡后立即失效，防止继续核销
+                    m.is_active = False
+                    m.balance = 0
+                    m.remaining_sessions = 0
+                    m.points = 0
+                    session.commit()
+                    msg = f"✅ 已为会员卡 #{membership_id} 办理退卡，退款 {refund_amount:g} 元。规则：{rule}"
+                    if reason:
+                        msg += f"。原因：{reason}"
+                    return {"success": True, "message": msg, "refund_amount": refund_amount}
+                # 老数据没有总次数记录：先失效防继续核销，再转人工
+                m.is_active = False
+                session.commit()
+                return {
+                    "success": False,
+                    "error": f"次卡 #{membership_id} 缺少开卡总次数记录，已先停用该卡防止误核销。剩余{m.remaining_sessions}次，请人工核算退款后到会员管理页确认",
+                }
+
+            balance = float(m.balance)
+            total = float(m.total_amount)
+            opened = m.opened_at
+            # 是否有真实消费记录（服务记录关联该卡）
+            has_consumption = session.query(ServiceRecord).filter(
+                ServiceRecord.membership_id == membership_id
+            ).count() > 0
+            within_cooldown = (date.today() - opened).days <= 7 and not has_consumption
+
+            if within_cooldown:
+                refund_amount = total
+                rule = "7天冷静期内且未消费，全额退款"
+            else:
+                refund_amount = balance
+                if has_consumption:
+                    rule = "退剩余余额（已消费部分按会员成交价享受，不按原价倒扣）"
+                else:
+                    rule = "已超过7天冷静期，退剩余余额"
+
+            m.is_active = False
+            m.balance = 0
+            m.remaining_sessions = 0
+            m.points = 0
+            session.commit()
+
+        msg = f"✅ 已为会员卡 #{membership_id} 办理退卡，退款 {refund_amount:g} 元。规则：{rule}"
+        if reason:
+            msg += f"。原因：{reason}"
+        return {
+            "success": True,
+            "message": msg,
+            "refund_amount": refund_amount,
+            "rule": rule,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def redeem_points(customer_name: str, points: int, item: Optional[str] = None) -> dict:
+    """积分兑换：将会员积分按100积分=10元折算计入余额。
+
+    Args:
+        customer_name: 顾客姓名（必填）
+        points: 兑换的积分数（必填，须为100的整数倍，100积分=10元）
+        item: 兑换说明，如"兑换洗发水"、"积分抵现"（可选）
+
+    Returns:
+        操作结果
+    """
+    db = _get_db()
+    try:
+        from database.models import Customer, Membership
+        if not isinstance(points, int) or points <= 0 or points % 100 != 0:
+            return {
+                "success": False,
+                "error": "兑换积分须为正整数且为100的整数倍（100积分=10元）",
+            }
+
+        with db.get_session() as session:
+            customer = session.query(Customer).filter(
+                Customer.name == customer_name
+            ).first()
+            if not customer:
+                return {"success": False, "error": f"找不到顾客「{customer_name}」"}
+            m = (
+                session.query(Membership)
+                .filter(Membership.customer_id == customer.id, Membership.is_active == True)  # noqa: E712
+                .order_by(Membership.id.desc())
+                .first()
+            )
+            if not m:
+                return {"success": False, "error": f"顾客「{customer_name}」没有有效会员卡"}
+            if m.points < points:
+                return {
+                    "success": False,
+                    "error": f"积分不足：当前{m.points}分，需{points}分",
+                }
+            m.points -= points
+            value = points / 10
+            m.balance = float(m.balance) + value
+            remaining_points = m.points
+            new_balance = float(m.balance)
+            session.commit()
+
+        note = f"，兑换「{item}」" if item else ""
+        return {
+            "success": True,
+            "message": (
+                f"✅ {customer_name} 用 {points} 积分兑换了 {value:g} 元余额{note}，"
+                f"剩余积分{remaining_points}，卡内余额{new_balance:g}元"
+            ),
+            "redeemed_value": value,
+            "remaining_points": remaining_points,
+            "balance": new_balance,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 # ================================================================
 # 产品销售相关
 # ================================================================
@@ -466,7 +741,42 @@ def record_product_sale(
     """
     db = _get_db()
     try:
+        # 🚫 基础校验：数量和金额必须为正
+        if not isinstance(quantity, (int, float)) or quantity <= 0:
+            return {"success": False, "error": f"⚠️ 销售数量必须大于0，当前值: {quantity}"}
+        if not isinstance(amount, (int, float)) or amount <= 0:
+            return {"success": False, "error": f"⚠️ 销售金额必须大于0，当前值: {amount}"}
+        # 🚫 顾客名非空校验（销售记录顾客可选，但填了就不能是空串）
+        if customer_name is not None and not str(customer_name).strip():
+            return {"success": False, "error": "⚠️ 顾客姓名不能为空白，请提供顾客姓名或不填"}
+
         sale_date = _parse_date(date_str)
+
+        # 📦 库存校验：销售前检查库存是否充足 + 产品是否存在
+        from database.models import Product
+        product_match = None
+        with db.get_session() as session:
+            candidates = session.query(Product).all()
+            for p in candidates:
+                if p.name == product_name or product_name in p.name or p.name in product_name:
+                    product_match = p
+                    break
+
+        # 产品必须存在
+        if not product_match:
+            return {
+                "success": False,
+                "error": f"⚠️ 产品「{product_name}」不存在，请先添加产品或检查名称是否正确。当前产品：{', '.join(p.name for p in candidates)}",
+            }
+
+        # 库存必须充足
+        if product_match.stock_quantity is not None and product_match.stock_quantity < quantity:
+            return {
+                "success": False,
+                "error": f"⚠️ 库存不足：{product_match.name}当前库存{product_match.stock_quantity}件，不够卖{quantity}件。请先入库补货。",
+                "current_stock": product_match.stock_quantity,
+                "requested_quantity": quantity,
+            }
 
         msg_id = db.save_raw_message({
             "msg_id": f"agent_prod_{datetime.now().timestamp()}",
@@ -480,13 +790,23 @@ def record_product_sale(
             "date": sale_date,
             "amount": amount,
             "quantity": quantity,
-            "unit_price": amount / quantity if quantity > 0 else amount,
+            "unit_price": round(amount / quantity, 2),
             "customer_name": customer_name,
             "notes": notes,
             "confirmed": True,
         }, msg_id)
 
-        return {
+        # 自动扣减库存并提交
+        remaining_stock = None
+        if product_match and product_match.stock_quantity is not None:
+            with db.get_session() as session:
+                p = session.query(Product).get(product_match.id)
+                if p:
+                    p.stock_quantity = p.stock_quantity - quantity
+                    remaining_stock = p.stock_quantity
+                    session.commit()
+
+        result = {
             "success": True,
             "message": f"✅ 已记录产品销售：{product_name} x{quantity} 共{amount}元",
             "sale_id": sale_id,
@@ -496,6 +816,9 @@ def record_product_sale(
             "customer": customer_name or "散客",
             "date": str(sale_date),
         }
+        if remaining_stock is not None:
+            result["remaining_stock"] = remaining_stock
+        return result
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -1364,3 +1687,144 @@ def get_business_overview() -> dict:
     except Exception as e:
         return {"success": False, "error": str(e)}
 
+
+
+# ================================================================
+# 预约相关
+# ================================================================
+
+
+def create_appointment(
+    customer_name: str,
+    service_name: str,
+    appointment_date: Optional[str] = None,
+    appointment_time: Optional[str] = None,
+    phone: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> dict:
+    """创建一条预约记录。
+
+    顾客说"明天下午两点剪个发"时调用。日期必须转成 YYYY-MM-DD（今天日期
+    见系统提示）；时间统一转成 24小时制 HH:MM（如 14:30）。
+
+    Args:
+        customer_name: 顾客姓名（必填）。
+        service_name: 预约的服务项目（必填，如"男士剪发"）。
+        appointment_date: 预约日期 YYYY-MM-DD，不传视为今天。
+        appointment_time: 预约时间 HH:MM（可选）。
+        phone: 联系电话（可选）。
+        notes: 备注（可选）。
+    """
+    try:
+        d = _parse_date(appointment_date)
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    if d < date.today():
+        return {"success": False,
+                "error": f"不能预约过去的日期（{d.isoformat()}），请和顾客确认正确日期后重试"}
+    name = str(customer_name).strip() if customer_name else ""
+    if not name:
+        return {"success": False, "error": "顾客姓名不能为空"}
+    service = str(service_name).strip() if service_name else ""
+    if not service:
+        return {"success": False, "error": "预约的服务项目不能为空"}
+    db = _get_db()
+    # 时段冲突检测：同日期+同时间已有未取消的预约则拒绝（防撞单）
+    if appointment_time:
+        conflict = db.list_appointments(target_date=d, status="pending") + \
+                   db.list_appointments(target_date=d, status="confirmed")
+        conflict = [c for c in conflict
+                    if (c.appointment_time or "") == str(appointment_time).strip()]
+        if conflict:
+            c = conflict[0]
+            return {"success": False,
+                    "error": f"{d.isoformat()} {appointment_time} 已有预约"
+                             f"（{c.customer_name}的{c.service_name}），"
+                             f"请和顾客商量改到其他时间"}
+    appt = db.create_appointment(
+        customer_name=name,
+        service_name=service,
+        appointment_date=d,
+        appointment_time=appointment_time,
+        phone=phone,
+        notes=notes,
+    )
+    logger.info(f"预约已创建: id={appt.id} {name} {service} {d} {appointment_time or ''}")
+    return {
+        "success": True,
+        "appointment_id": appt.id,
+        "customer_name": appt.customer_name,
+        "service_name": appt.service_name,
+        "appointment_date": appt.appointment_date.isoformat(),
+        "appointment_time": appt.appointment_time,
+        "status": appt.status,
+        "message": f"已为{name}预约{appt.appointment_date.isoformat()} "
+                   f"{appt.appointment_time or ''}的{service}",
+    }
+
+
+def list_appointments(
+    date_str: Optional[str] = None,
+    status: Optional[str] = None,
+) -> dict:
+    """查询预约列表。
+
+    顾客或店主问"明天有什么预约"时调用。不传日期则查今天起的 upcoming。
+
+    Args:
+        date_str: 查询某天的预约 YYYY-MM-DD（可选）。
+        status: 按状态过滤：pending/confirmed/completed/cancelled/no_show（可选）。
+    """
+    db = _get_db()
+    try:
+        from datetime import timedelta
+        if date_str:
+            d = _parse_date(date_str)
+            appts = db.list_appointments(target_date=d, status=status)
+        else:
+            appts = db.list_appointments(
+                start_date=date.today(),
+                end_date=date.today() + timedelta(days=30),
+                status=status,
+            )
+        items = [{
+            "id": a.id,
+            "customer_name": a.customer_name,
+            "service_name": a.service_name,
+            "date": a.appointment_date.isoformat(),
+            "time": a.appointment_time,
+            "status": a.status,
+            "phone": a.phone,
+        } for a in appts]
+        return {"success": True, "count": len(items), "appointments": items}
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+
+
+def update_appointment_status(appointment_id: int, new_status: str) -> dict:
+    """更新预约状态。
+
+    顾客确认到店、取消预约、爽约时调用。状态只能按合法路径流转：
+    待确认→已确认→已完成；任意未完成状态可取消/标爽约；终态不可回退。
+
+    Args:
+        appointment_id: 预约ID（必填）。
+        new_status: 新状态（必填）：confirmed=已确认 / completed=已完成 /
+                    cancelled=已取消 / no_show=爽约。
+    """
+    db = _get_db()
+    try:
+        appt = db.appointments.update_status(int(appointment_id), str(new_status).strip())
+    except (ValueError, TypeError) as e:
+        return {"success": False, "error": f"状态更新失败: {e}"}
+    if not appt:
+        return {"success": False, "error": f"未找到ID为{appointment_id}的预约"}
+    logger.info(f"预约状态更新: id={appt.id} -> {appt.status}")
+    return {
+        "success": True,
+        "appointment_id": appt.id,
+        "customer_name": appt.customer_name,
+        "service_name": appt.service_name,
+        "date": appt.appointment_date.isoformat(),
+        "status": appt.status,
+    }

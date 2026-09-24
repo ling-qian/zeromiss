@@ -1,0 +1,675 @@
+"""美业知识库模块 — KnowledgeBase
+
+轻量级关键词匹配知识库，在 LLM 调用前先检索 FAQ / SOP / 行业常识。
+命中时直接返回标准答案，未命中则返回 None 交给 LLM + function calling 处理。
+
+数据来源：
+  - sop-library/beauty/faq.md（主 FAQ 17 条）
+  - sop-library/beauty/faq-supplement-202606.md（补充 FAQ 13 条）
+  - sop-library/beauty/faq-tiaopin-202607.md（调频规则 2 类）
+  - sop-library/beauty/appointment.md（预约流程 SOP）
+  - sop-library/beauty/sales.md（销售话术 SOP）
+  - sop-library/beauty/coze-agent-persona.md（人设核心定位）
+  - 新增美业门店日常常见问答
+"""
+
+import re
+import json
+import os
+from typing import Optional, Dict, List, Any
+from loguru import logger
+
+
+class KnowledgeBase:
+    """美业 AI 店长助手知识库
+
+    使用方式：
+        kb = KnowledgeBase()
+        result = kb.lookup("太贵了")
+        if result:
+            print(result["answer"])   # 直接返回，不走 LLM
+        else:
+            # 交给 LLM + function calling
+
+    数据持久化：
+        条目优先从 JSON 文件加载（config/knowledge_base_data.json），
+        JSON 不存在时从代码内置数据初始化并自动保存一份 JSON。
+        通过 Web 界面增删改的条目会实时写入 JSON 文件。
+    """
+
+    # JSON 数据文件路径（与本文件同目录）
+    _DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "knowledge_base_data.json")
+
+    def __init__(self):
+        self._faq: List[Dict[str, Any]] = []
+        self._sop: List[Dict[str, Any]] = []
+        self._tuning: List[Dict[str, Any]] = []
+        self._industry: List[Dict[str, Any]] = []
+        self._load_all()
+
+    # ============================================================
+    # 公共接口
+    # ============================================================
+
+    def lookup(self, user_input: str) -> Optional[Dict[str, Any]]:
+        """检索知识库，返回最匹配的条目或 None。
+
+        优先级：调频规则 > FAQ > SOP > 行业常识
+
+        Args:
+            user_input: 用户输入的原始文本
+
+        Returns:
+            匹配结果字典，包含：
+              - category: 分类（tuning/faq/sop/industry）
+              - question: 匹配到的问题
+              - answer: 标准回答
+              - follow_up: 推荐追问（可选）
+            未匹配返回 None
+        """
+        import re
+        # 去除emoji和特殊字符，只保留中文/英文/数字/常见标点
+        text = re.sub(r'[^\w\u4e00-\u9fff，。？！、；：""''（）\s]', '', user_input)
+        text = text.strip().lower()
+
+        # 1. 调频规则最高优先级
+        result = self._match_list(text, self._tuning, "tuning")
+        if result:
+            return result
+
+        # 2. FAQ
+        result = self._match_list(text, self._faq, "faq")
+        if result:
+            return result
+
+        # 3. SOP
+        result = self._match_list(text, self._sop, "sop")
+        if result:
+            return result
+
+        # 4. 行业常识
+        result = self._match_list(text, self._industry, "industry")
+        if result:
+            return result
+
+        return None
+
+    def search(self, keyword: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """搜索知识库，返回匹配的条目列表（管理端用）"""
+        all_items = self._tuning + self._faq + self._sop + self._industry
+        results = []
+        kw = keyword.lower()
+        for item in all_items:
+            # 关键词匹配
+            if any(kw in k.lower() for k in item.get("keywords", [])):
+                results.append(item)
+            # 问题文本匹配
+            elif kw in item.get("question", "").lower():
+                results.append(item)
+        return results[:limit]
+
+    def get_stats(self) -> Dict[str, int]:
+        """返回知识库统计信息"""
+        return {
+            "tuning": len(self._tuning),
+            "faq": len(self._faq),
+            "sop": len(self._sop),
+            "industry": len(self._industry),
+            "total": len(self._tuning) + len(self._faq) + len(self._sop) + len(self._industry),
+        }
+
+    # ============================================================
+    # CRUD 操作（Web 管理界面用）
+    # ============================================================
+
+    def list_items(self, category: Optional[str] = None) -> List[Dict[str, Any]]:
+        """列出知识库条目，可按分类过滤"""
+        if category == "tuning":
+            items = self._tuning
+        elif category == "faq":
+            items = self._faq
+        elif category == "sop":
+            items = self._sop
+        elif category == "industry":
+            items = self._industry
+        elif category is None or category == "":
+            items = self._tuning + self._faq + self._sop + self._industry
+        else:
+            return []  # 非法分类返回空
+
+        # 给每条加上 id 和 category
+        result = []
+        for i, item in enumerate(items):
+            entry = dict(item)
+            entry["id"] = i
+            if "category" not in entry:
+                # 推断分类
+                if item in self._tuning:
+                    entry["category"] = "tuning"
+                elif item in self._faq:
+                    entry["category"] = "faq"
+                elif item in self._sop:
+                    entry["category"] = "sop"
+                elif item in self._industry:
+                    entry["category"] = "industry"
+            result.append(entry)
+        return result
+
+    def add_item(self, category: str, item: Dict[str, Any]) -> bool:
+        """新增知识库条目
+
+        Args:
+            category: 分类 (tuning/faq/sop/industry)
+            item: 条目数据，必须包含 question, keywords, answer
+        """
+        required = ["question", "keywords", "answer"]
+        if not all(k in item for k in required):
+            return False
+        if category not in ("tuning", "faq", "sop", "industry"):
+            return False
+
+        target = getattr(self, f"_{category}")
+        target.append(item)
+        self._save_to_file()
+        logger.info(f"知识库新增 [{category}]: {item['question']}")
+        return True
+
+    def update_item(self, category: str, index: int, item: Dict[str, Any]) -> bool:
+        """更新知识库条目"""
+        target = getattr(self, f"_{category}", None)
+        if target is None or index < 0 or index >= len(target):
+            return False
+
+        target[index].update(item)
+        self._save_to_file()
+        logger.info(f"知识库更新 [{category}][{index}]: {item.get('question', '')}")
+        return True
+
+    def delete_item(self, category: str, index: int) -> bool:
+        """删除知识库条目"""
+        target = getattr(self, f"_{category}", None)
+        if target is None or index < 0 or index >= len(target):
+            return False
+
+        removed = target.pop(index)
+        self._save_to_file()
+        logger.info(f"知识库删除 [{category}][{index}]: {removed.get('question', '')}")
+        return True
+
+    # ============================================================
+    # 持久化（JSON 文件）
+    # ============================================================
+
+    def _save_to_file(self):
+        """将当前知识库保存到 JSON 文件"""
+        data = {
+            "tuning": self._tuning,
+            "faq": self._faq,
+            "sop": self._sop,
+            "industry": self._industry,
+        }
+        try:
+            with open(self._DATA_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            logger.debug(f"知识库已保存到 {self._DATA_FILE}")
+        except Exception as e:
+            logger.error(f"知识库保存失败: {e}")
+
+    def _load_from_file(self) -> bool:
+        """从 JSON 文件加载知识库，成功返回 True"""
+        if not os.path.exists(self._DATA_FILE):
+            return False
+        try:
+            with open(self._DATA_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._tuning = data.get("tuning", [])
+            self._faq = data.get("faq", [])
+            self._sop = data.get("sop", [])
+            self._industry = data.get("industry", [])
+            logger.info(f"知识库从 JSON 文件加载: {self.get_stats()}")
+            return True
+        except Exception as e:
+            logger.error(f"知识库 JSON 文件加载失败: {e}")
+            return False
+
+    # ============================================================
+    # 内部匹配逻辑
+    # ============================================================
+
+    def _match_list(
+        self, text: str, items: List[Dict[str, Any]], category: str
+    ) -> Optional[Dict[str, Any]]:
+        """在给定列表中做关键词匹配，返回最佳匹配"""
+        best_match = None
+        best_score = 0
+
+        for item in items:
+            score = 0
+            keywords = item.get("keywords", [])
+
+            for kw in keywords:
+                kw_lower = kw.lower()
+                # 完整匹配加分
+                if kw_lower in text:
+                    score += len(kw_lower)  # 长关键词权重更高
+                # 部分匹配（至少2字）
+                elif len(kw_lower) >= 2 and kw_lower in text:
+                    score += len(kw_lower) * 0.5
+
+            # 排除词检查：如果用户输入包含排除词，跳过该条目
+            exclude = item.get("exclude_keywords", [])
+            if any(ex.lower() in text for ex in exclude):
+                continue
+
+            if score > best_score:
+                best_score = score
+                best_match = item
+
+        # 至少匹配到1个关键词才返回
+        if best_match and best_score >= 1:
+            result = {
+                "category": category,
+                "question": best_match["question"],
+                "answer": best_match["answer"],
+            }
+            if "follow_up" in best_match:
+                result["follow_up"] = best_match["follow_up"]
+            return result
+
+        return None
+
+    # ============================================================
+    # 数据加载
+    # ============================================================
+
+    def _load_all(self):
+        """加载所有知识库数据。优先从 JSON 文件加载，不存在则从内置数据初始化并保存 JSON。"""
+        if self._load_from_file():
+            return  # JSON 文件加载成功
+
+        # JSON 不存在，从内置数据初始化
+        self._load_tuning_rules()
+        self._load_faq()
+        self._load_sop()
+        self._load_industry()
+
+        # 首次保存 JSON 文件，方便后续 Web 管理界面修改
+        self._save_to_file()
+        logger.info("知识库从内置数据初始化并保存 JSON")
+
+    def _load_tuning_rules(self):
+        """调频规则（最高优先级，异议类问题先理解再回应）"""
+
+        self._tuning = [
+            {
+                "question": "客户嫌贵",
+                "keywords": ["太贵", "好贵", "贵了", "能不能便宜", "便宜点", "太贵了", "好贵啊", "贵不贵"],
+                "exclude_keywords": ["不贵", "还行", "可以"],
+                "answer": "姐我理解，您是不是之前遇到过那种低价引流、做到一半加钱的情况？",
+                "follow_up": "根据客户回答分支：如果'对/就是'→那种真的很坑，所以我们才坚持报全价，做之前说清楚多少钱就是多少钱。如果'没有/就是觉得贵'→姐我完全理解～来帮您算笔账。",
+            },
+            {
+                "question": "客户问为什么比别家贵",
+                "keywords": ["为什么贵", "比别家贵", "比别的贵", "别人家便宜", "别家便宜", "怎么比别人贵"],
+                "exclude_keywords": [],
+                "answer": "姐您了解过别家呀，说明您很用心在选～能说说您最看重什么吗？是效果、安全还是服务？",
+                "follow_up": "知道客户关注点后，只讲跟关注点相关的差异，不要一口气倒三点。",
+            },
+            {
+                "question": "客户说别家才99/低价对比",
+                "keywords": ["别家才", "别人才", "别家只要", "别家99", "99块", "别家更便宜"],
+                "exclude_keywords": [],
+                "answer": "姐99那种我也有客人做过，您做完感觉怎么样？是觉得效果不太满意吗？",
+                "follow_up": "如果客户说效果不好→很多客人也是体验过后来找我们的，主要是产品浓度和仪器差别比较大。如果客户还没做→那种通常是体验价，做到一半加不加项目？我们报的就是全价。",
+            },
+            {
+                "question": "客户质疑效果",
+                "keywords": ["效果不好", "没效果", "没用", "效果不明显", "做完没用", "朋友做完没用"],
+                "exclude_keywords": ["有效果", "效果不错", "效果好"],
+                "answer": "姐您朋友做的是什么项目呀？是在正规机构做的吗？",
+                "follow_up": "如果是不正规机构→效果跟机构和操作关系很大。如果是正规机构→每个人肤质不同效果也有差异，可以先做检测评估。",
+            },
+            {
+                "question": "客户对比竞品",
+                "keywords": ["和别家有什么区别", "跟别家区别", "你们和", "跟xx家", "跟那家", "区别在哪"],
+                "exclude_keywords": [],
+                "answer": "姐您了解过XX家呀，说明您很用心在选～能说说您最看重什么吗？",
+                "follow_up": "知道关注点后只讲跟关注点相关的差异，绝不贬低同行。",
+            },
+        ]
+
+    def _load_faq(self):
+        """FAQ — 来自主FAQ(17条) + 补充FAQ(13条) = 30条"""
+
+        self._faq = [
+            # ====== 一、价格类 ======
+            {
+                "question": "做一次多少钱/有价格表吗",
+                "keywords": ["多少钱", "价格表", "什么价格", "怎么收费", "收费多少", "价格多少", "价位"],
+                "answer": "不同项目价格不一样哦～方便告诉我您最想改善什么问题吗？我帮您精准推荐，避免花冤枉钱。",
+                "follow_up": "您更关注补水、祛痘、抗衰还是美白呀？",
+            },
+            {
+                "question": "会不会有隐形消费/中途加价",
+                "keywords": ["隐形消费", "中途加价", "加项目", "做到一半", "隐形", "乱收费", "额外收费"],
+                "answer": "这点您完全放心～我们承诺全程价格透明，报价就是实价，不存在中途加项目、加费用的情况。到店后发型师会先跟您确认今天做的项目和总价，您同意了才动手。",
+            },
+            {
+                "question": "会不会推销办卡",
+                "keywords": ["推销", "办卡", "推销办卡", "烦推销", "不想办卡", "逼单", "强推"],
+                "answer": "姐我跟您说句实在话——71%的顾客都烦推销，我们也知道。所以我们不搞'剪发30分钟推销25分钟'那套。您来体验，觉得好再聊下一步，觉得不合适也没关系，绝不会给您压力。我们靠的是回头客，不是一次性套路。",
+            },
+            {
+                "question": "可以先告诉我总价吗",
+                "keywords": ["先说总价", "先报价", "一共多少钱", "总价", "全部价格", "先告诉我价格"],
+                "answer": "当然可以！姐您跟我说想做什么项目，我直接给您报全价，包括用的什么产品、多长时间、有没有额外费用，全部说清楚。我们就是做透明消费的，您确认了再开始。",
+            },
+            {
+                "question": "别人家比你便宜有什么区别",
+                "keywords": ["别人便宜", "便宜区别", "别家便宜区别", "便宜有什么不同"],
+                "answer": "姐，价格差主要在这几个地方：一是产品，我们用医用级/国际一线品牌；二是流程，先沟通需求再推荐，不搞低价引流进店再升单；三是售后，做完不满意15天内可以免费调整。您之前在别家遇到过什么不满意的吗？我帮您分析一下区别。",
+            },
+
+            # ====== 二、效果类 ======
+            {
+                "question": "做一次能看出效果吗",
+                "keywords": ["做一次有效果", "一次效果", "能看出效果", "做完马上", "即时效果"],
+                "answer": "即时效果肯定有！做完半边脸您自己照镜子就能看到对比——提拉、提亮、毛孔细腻都是当下可见的。但要稳定效果，皮肤代谢周期是28天，建议至少坚持3-6次。就像健身，跑一次会出汗，但练出马甲线需要坚持。",
+            },
+            {
+                "question": "多久能见效/要做多少次",
+                "keywords": ["多久见效", "做多少次", "几次有效", "多久出效果", "要几次"],
+                "answer": "深层清洁/补水：1次就能感觉皮肤透亮水润。祛痘/消炎：一般2-3次痘痘明显瘪下去。祛斑/美白：需要3-5次，配合居家防晒。抗衰/紧致：6次一个疗程，3个月后紧致度提升最明显。具体要根据您的肤质检测结果来定～",
+            },
+            {
+                "question": "效果能维持多久",
+                "keywords": ["维持多久", "效果多久", "能管多久", "保持多久"],
+                "answer": "基础补水：维持1-2周。光子嫩肤：维持3-6个月。抗衰项目（热玛吉/超声炮）：维持6-12个月。居家配合防晒+保湿，维持时间能延长50%以上。我们做完会给您专属的居家护理方案～",
+            },
+            {
+                "question": "做多了会不会让皮肤变薄/有依赖性",
+                "keywords": ["皮肤变薄", "依赖性", "有依赖", "角质变薄", "越做越薄"],
+                "answer": "专业操作不会！正确护理是在修护皮肤屏障、增强耐受度。觉得'依赖'其实是皮肤回到原本状态了——就像吃饭，不是依赖，是正常代谢需要。我们用的都是温和不损伤角质的产品，您放心。",
+            },
+            {
+                "question": "做完之后每天需要花多少时间打理",
+                "keywords": ["打理时间", "每天打理", "花多少时间", "日常打理", "好不好打理"],
+                "answer": "这个问题问得好！姐，您每天早上大概能花多少时间弄头发？5分钟？10分钟？如果时间少，我们会推荐免打理的方案——大风吹干就能出门。如果您愿意花15分钟以上，那选择范围就更大了。先告诉我您的日常打理时间，我帮您选最合适的方案。",
+            },
+
+            # ====== 三、安全类 ======
+            {
+                "question": "会不会过敏/敏感肌能做吗",
+                "keywords": ["过敏", "敏感肌", "敏感皮肤", "会不会过敏", "能做吗"],
+                "answer": "姐，敏感肌更要科学护理！我们操作前会做皮肤检测和耳后过敏测试。大部分敏感肌都能做，我们会选温和舒缓方案，避开刺激性成分。您方便的话可以先到店做免费皮肤检测，我帮您判断适合什么项目。",
+            },
+            {
+                "question": "疼不疼/有没有恢复期",
+                "keywords": ["疼不疼", "痛不痛", "恢复期", "疼吗", "会痛吗"],
+                "answer": "基础护理（清洁/补水）完全不疼，做的时候很舒服甚至会睡着～微创项目（水光/光子）有轻微刺感，但会敷麻药。恢复期一般1-3天，期间注意防晒和保湿就行，不影响正常出门。",
+            },
+            {
+                "question": "产品安全吗/仪器正规吗",
+                "keywords": ["产品安全", "仪器正规", "安全吗", "正规吗", "有没有认证"],
+                "answer": "我们所有产品都有国家备案，仪器都是正规进口有认证的。到店可以扫码验真，注射类材料提供防伪查询。我们持《医疗机构执业许可证》，医生资质公开可查。",
+            },
+            {
+                "question": "头皮很敏感做护理会不会刺激",
+                "keywords": ["头皮敏感", "头皮刺激", "头皮护理刺激", "敏感头皮"],
+                "answer": "姐，敏感头皮更要做，但一定要用对产品和方法。我们用的是院线级温和配方，操作前会先做头皮检测确认敏感程度，然后选择适合的方案。全程不用刺激性成分，做完反而会觉得头皮舒服很多。建议先到店做个免费检测。",
+            },
+
+            # ====== 四、预约与流程类 ======
+            {
+                "question": "怎么预约/需要提前多久",
+                "keywords": ["怎么预约", "如何预约", "预约方式", "怎么约", "要提前多久"],
+                "answer": "微信/电话/线上平台都可以约～建议提前1-2天预约，周末比较满可能需提前3天。第一次来我帮您安排资深顾问做免费皮肤检测，全程约90分钟。您方便什么时间段？",
+            },
+            {
+                "question": "做一次要多久",
+                "keywords": ["做一次多久", "要多久", "花多长时间", "多长时间"],
+                "answer": "基础清洁+补水：60分钟。深层清洁+导入：90分钟。抗衰项目：90-120分钟。综合套餐：120分钟。第一次到店加15分钟皮肤检测和问诊～",
+            },
+            {
+                "question": "可以带朋友一起来吗",
+                "keywords": ["带朋友", "两个人", "一起做", "闺蜜一起", "带人"],
+                "answer": "当然可以！两人同行还有闺蜜优惠～您告诉我朋友想做什么项目，我帮你们安排相邻房间或双人间。",
+            },
+            {
+                "question": "办卡后可以退吗",
+                "keywords": ["办卡退", "可以退吗", "退卡", "退款", "能退吗"],
+                "answer": "未消费项目随时可退，已消费部分按单次原价扣除后退余额。合同里写得很清楚，您放心。",
+            },
+            {
+                "question": "做完不满意怎么办",
+                "keywords": ["不满意", "做完不好", "效果不好怎么办", "不满意怎么办"],
+                "answer": "做完当场有任何不舒服或效果不满意，您直接跟老师说，我们当场调整方案。项目结束后24小时内我也会跟进您的状态。如果确实不满意，我们有无忧退款政策。",
+            },
+
+            # ====== 五、头皮护理类 ======
+            {
+                "question": "掉头发多是什么原因/能做头皮护理吗",
+                "keywords": ["掉头发", "脱发", "掉发", "头发少", "秃", "头皮护理"],
+                "answer": "姐，脱发的原因有很多种——压力、作息、饮食、激素变化都可能。我们建议先做一次专业头皮检测，看看是油脂堵塞、毛囊萎缩还是其他原因。检测是免费的，做完我们再给您推荐对症的方案，不会让您盲目买产品。",
+            },
+            {
+                "question": "头皮护理是什么/跟普通洗头有什么区别",
+                "keywords": ["头皮护理是什么", "跟洗头区别", "头皮护理区别", "头皮和洗头"],
+                "answer": "普通洗头就是清洁表面油脂，头皮护理是深层清洁+毛囊疏通+营养导入。打个比方，普通洗头像洗脸，头皮护理像做一次深层清洁面膜+精华导入。特别是头油多、掉发、头皮敏感的人，光靠洗发水解决不了根子上的问题。",
+            },
+            {
+                "question": "头皮护理要做几次才有效",
+                "keywords": ["头皮几次", "头皮多少次", "头皮多久"],
+                "answer": "头油控制：一般2-3次就能感觉出油速度明显变慢。脱发改善：需要6-8次为一个疗程，3个月后看到效果。头皮敏感修护：4-6次屏障功能明显改善。具体要根据您的头皮检测结果来定，检测免费，先看看再决定～",
+            },
+
+            # ====== 六、选店与信任类 ======
+            {
+                "question": "怎么判断一家店靠不靠谱",
+                "keywords": ["怎么判断", "靠不靠谱", "怎么选", "怎么挑", "选店"],
+                "answer": "姐，三个标准：第一看经营年限，能活5年以上的至少经过了市场筛选；第二看价格是否透明，敢明码标价、不中途加价的店基本靠谱；第三看售后政策，提供15天以上免费调整期的店说明对技术有底气。我们这三个都能做到，您放心。",
+            },
+            {
+                "question": "跟网红店有什么区别",
+                "keywords": ["网红店", "网红区别", "跟网红"],
+                "answer": "姐，网红店靠装修和营销吸引人，但差评很多集中在'效果和图片不符''推销办卡'。我们走的是不一样的路——技术透明、产品靠谱、售后有保障。不搞花里胡哨的营销，靠的是回头客和口碑。您来体验一次就知道了。",
+            },
+            {
+                "question": "你们跟别家有什么区别",
+                "keywords": ["有什么区别", "跟别家区别", "有什么不同", "优势在哪", "特色"],
+                "answer": "三个不一样：①不做流水线，每次先检测再定制方案；②不强行推销高价项目，只推荐适合您的；③不胡乱叠加套餐，做完有效果再聊下一步。姐您先来体验一次感受下服务和效果。",
+            },
+            {
+                "question": "男生能来吗",
+                "keywords": ["男生能做", "男的能做", "男士能做", "男人能做", "男生能来", "男士能来"],
+                "exclude_keywords": ["多少钱", "价格", "收费", "剪发"],
+                "answer": "当然可以！我们有很多男性客人，主要做深层清洁、祛黑头、控油调理。男生皮肤油脂分泌更旺盛，其实更需要定期管理～",
+            },
+
+            # ====== 七、预期管理类 ======
+            {
+                "question": "想做同款发型能做到一模一样吗",
+                "keywords": ["同款", "一模一样", "参考图", "图片效果", "做成一样"],
+                "answer": "姐，这个发型确实好看！不过我实话跟您说，参考图上的效果跟您实际做到的可能会有一些差异，因为每个人的脸型、发质、发量都不一样。到店后发型师会根据您的脸型和发质帮您调整方案，确保做出来的效果最适合您。您方便发一张您现在的照片吗？我帮您初步看看适合什么方向。",
+            },
+            {
+                "question": "为什么朋友做出来的效果跟想要的不一样",
+                "keywords": ["效果不一样", "跟想要不一样", "效果不符", "图片不符"],
+                "answer": "姐，这个特别常见。效果图是'理想状态'，但实际效果受发质基础、脸型比例、日常打理时间三个因素影响。所以我们会先跟您充分沟通，帮您把预期调到合理范围，做出来的效果您才会满意。建议到店先做个免费咨询。",
+            },
+        ]
+
+    def _load_sop(self):
+        """SOP 知识 — 预约流程、销售场景、获客流程"""
+
+        self._sop = [
+            # ====== 预约流程 SOP ======
+            {
+                "question": "预约流程",
+                "keywords": ["预约流程", "怎么预约", "预约步骤", "怎么约时间"],
+                "answer": "预约流程：①告诉我您想做的项目+方便的时间段 ②我帮您查可用时段 ③确认预约信息（项目+时间+时长+老师） ④发送预约确认 ⑤到店前24h提醒 ⑥到店前2h发地址。建议提前1-2天预约，周末提前3天。第一次来会安排免费皮肤检测。",
+            },
+            {
+                "question": "预约确认信息模板",
+                "keywords": ["预约确认", "预约信息", "预约码"],
+                "answer": "✅ 预约成功！\n📋 预约信息确认：\n- 项目：\n- 时间：\n- 时长：\n- 老师：\n- 地址：\n- 预约码：\n📍 到店前15分钟到即可\n💡 建议素颜或淡妆到店\n如有变动请提前2小时告知～",
+            },
+            {
+                "question": "到店前提醒内容",
+                "keywords": ["到店提醒", "预约提醒", "来之前", "提醒我"],
+                "answer": "到店前24h：提醒明天预约，建议早睡保湿。到店前2h：发地址和交通指引，到了直接跟前台说预约码就行。到店前15分钟到即可，不用太早。",
+            },
+            {
+                "question": "护理后跟进流程",
+                "keywords": ["做完之后", "护理后", "离店后", "回去之后", "后续注意"],
+                "answer": "离店2小时：回访感受+居家护理提醒（今晚清水洗脸+连敷三天补水面膜+注意防晒）。离店24小时：关心皮肤状态。离店3天：推荐下次护理时间。下次护理建议在2-3周后。",
+            },
+            {
+                "question": "客户取消改约怎么处理",
+                "keywords": ["取消预约", "改约", "改时间", "取消", "改期"],
+                "answer": "没问题姐，帮您改到XX时间～如果频繁改约（3次以上），温柔询问真实顾虑：姐，我发现您已经改期3次了，是时间不合适还是对项目有顾虑？跟我说说，我帮您调整～",
+            },
+            {
+                "question": "客户迟到怎么处理",
+                "keywords": ["迟到", "来晚了", "晚到", "可能迟到"],
+                "answer": "迟到15分钟内：保留预约，慢慢来不急注意安全。迟到15-30分钟：可能需等待或缩短项目时间。迟到30分钟以上：协商改约或调整为短时项目。",
+            },
+            {
+                "question": "客户爽约怎么处理",
+                "keywords": ["爽约", "没来", "没到", "放鸽子"],
+                "answer": "姐，今天下午的预约没等到您，是临时有事吗？没关系，我帮您重新安排一个时间？",
+            },
+
+            # ====== 销售场景 SOP ======
+            {
+                "question": "客户主动问价怎么转化",
+                "keywords": ["问价转化", "怎么报价", "报价技巧", "先报价"],
+                "answer": "不要直接报高价！先问需求再报价：姐，不同项目价格不一样～您主要想改善什么？补水、祛痘、抗衰还是美白？我帮您精准推荐，不花冤枉钱～了解需求后推荐1-2个对症项目再说价格，然后引导到店体验。",
+            },
+            {
+                "question": "客户嫌贵怎么转化",
+                "keywords": ["嫌贵转化", "太贵了转化", "价格异议转化"],
+                "answer": "三步说服法：①共情→姐我完全理解，第一次接触都会觉得有点贵～ ②拆解算账→季卡2980包12次，单次才248，比单次省150，精华浓度是普通3倍做一次顶三次 ③价值锚定→一件大衣两三千穿一季，皮肤要穿一辈子，一天不到一杯奶茶钱。要不先体验一次感受下？",
+            },
+            {
+                "question": "客户说回去跟老公商量",
+                "keywords": ["回去商量", "跟老公商量", "跟家人商量", "回去想想", "考虑一下"],
+                "answer": "姐我特别理解。不过您想啊，您把脸保养得漂漂亮亮的，老公带出去也有面子对吧～而且这是花在您自己身上的健康投资，又不是乱花钱。等效果出来了，他不问价格都会夸您变好看了～要不先体验一次？",
+            },
+            {
+                "question": "客户说已经在别家办了",
+                "keywords": ["在别家办了", "别家办卡", "已经办了", "别家会员"],
+                "answer": "挺好呀，说明姐是注重保养的人！很多客人都是两三家同时用——就像健身房，离家近的做日常，专业的做专项。我们的XX项目刚好是别家比较少做的，您有空来体验一次对比看看？",
+            },
+            {
+                "question": "意向分级标准",
+                "keywords": ["意向分级", "客户意向", "判断意向", "意向等级"],
+                "answer": "高意向🔥：主动问价格、问预约、问具体项目→直接引导预约体验。中意向🤔：问效果、问安全、问对比→发案例+邀约免费检测。低意向❄️：随便看看、只问不答→留联系方式+定期触达。",
+            },
+            {
+                "question": "转人工触发条件",
+                "keywords": ["转人工", "转店长", "人工服务", "找真人"],
+                "answer": "以下情况立即转人工：①客户明确说'我想办卡/预约' ②连续2轮无法解决客户疑虑 ③客户投诉或情绪激动 ④涉及复杂治疗方案 ⑤客户要求人工服务 ⑥注射/侵入类项目咨询→一律转人工面诊 ⑦孕期/哺乳期客户→建议先咨询医生+转人工。",
+            },
+
+            # ====== 获客 SOP ======
+            {
+                "question": "获客核心公式",
+                "keywords": ["获客", "拓客", "怎么获客", "怎么拓客", "拉新", "新客"],
+                "answer": "美业获客核心公式：同城曝光 × 低价体验 × 到店转化 × 私域复购 × 老带新裂变。最低成本启动：抖音同城（0元）+小红书种草（0-50元/客）+大众点评近场截流。老带新是最便宜的获客方式，开发新客成本是维护老客的5-10倍。",
+            },
+            {
+                "question": "老带新裂变怎么做",
+                "keywords": ["老带新", "转介绍", "裂变", "带朋友来", "闺蜜卡"],
+                "answer": "裂变方式：①闺蜜卡：老客带1位新客到店，双方各送1次基础护理 ②拼团：2人成团每人立减50元 ③分享有礼：转发活动海报到朋友圈，到店领小样 ④推荐返佣：推荐新客办卡返10%现金或等值项目。关键：裂变要简单，客户只需要转发或带人来。",
+            },
+            {
+                "question": "朋友圈怎么发",
+                "keywords": ["朋友圈", "发圈", "朋友圈内容", "怎么发圈"],
+                "answer": "朋友圈每天1-2条，内容配比：40%专业知识+30%客户案例+20%门店日常+10%活动。不要只发广告，要有'人味'。示例：'今天有个客户做完护理说比睡一觉还舒服，这句话够我开心一天'",
+            },
+        ]
+
+    def _load_industry(self):
+        """行业常识 — 美业门店日常经营常见问答"""
+
+        self._industry = [
+            # ====== 新趋势术语 ======
+            {
+                "question": "什么是骨相设计剪发",
+                "keywords": ["骨相设计", "骨相剪发", "根据脸型", "脸型设计"],
+                "answer": "骨相设计剪发是根据三庭五眼比例、颅顶高度、颧骨宽度等面部特征，结合穿搭风格、职业需求和日常打理时间做一客一定制。不是流水线式盲剪，而是'根据脸型来设计发型'。到店后发型师会帮您分析脸型特点，免费沟通方案～",
+            },
+            {
+                "question": "什么是烫型不烫卷",
+                "keywords": ["烫型", "免打理", "免打理烫", "不烫卷", "自然烫"],
+                "answer": "2026年主流烫发理念。不是追求密集卷度，而是重塑头发的支撑结构，让发丝自然蓬松有型。大风吹干就能出门，不用每天花时间打理。很适合不想每天花时间打理头发的姐妹～",
+            },
+            {
+                "question": "什么是微潮色/生活色",
+                "keywords": ["微潮色", "生活色", "低调颜色", "不掉色", "自然色"],
+                "answer": "2026年染发主流方向。微潮色是低调但带点设计感的颜色（如高级混血感、光线染），生活色是日常自然色系。区别于夸张色系，对发质损伤更小、掉色更慢。适合不想太夸张的姐妹～",
+            },
+            {
+                "question": "什么是头皮抗衰",
+                "keywords": ["头皮抗衰", "头皮老化", "头皮松弛"],
+                "answer": "针对头皮老化（松弛、出油、脱发）的院线级护理方案。用专业检测+院线产品做深层理疗，不是普通洗发水能替代的。建议先做免费头皮检测，看看您的头皮状态。",
+            },
+
+            # ====== 门店日常常识 ======
+            {
+                "question": "营业时间",
+                "keywords": ["营业时间", "几点开门", "几点下班", "开门时间", "上班时间", "什么时候营业"],
+                "answer": "营业时间请咨询门店确认，一般美业门店营业时间为10:00-20:00。建议提前1-2天预约，周末比较满可能需提前3天。",
+            },
+            {
+                "question": "门店地址/怎么来",
+                "keywords": ["地址", "在哪", "怎么去", "怎么走", "位置", "在哪条路"],
+                "answer": "门店地址请咨询门店确认，到店后直接跟前台说预约码就行。如需交通指引可以问我～",
+            },
+            {
+                "question": "停车方便吗",
+                "keywords": ["停车", "车位", "好停车吗", "有停车场"],
+                "answer": "停车情况请咨询门店确认，一般楼下或附近有停车场。到店前可以提前问一下停车指引。",
+            },
+            {
+                "question": "可以用医保卡吗",
+                "keywords": ["医保", "医保卡", "社保"],
+                "answer": "美业项目一般不支持医保卡支付。我们支持微信/支付宝/银行卡支付，办卡客户还可以用储值卡余额抵扣。",
+            },
+            {
+                "question": "可以开发票吗",
+                "keywords": ["发票", "开票", "要发票", "开发票"],
+                "answer": "可以的，消费后可以开具正规发票。您需要普票还是专票？提前告诉前台，离店时给您开好。",
+            },
+            {
+                "question": "消毒卫生怎么做",
+                "keywords": ["消毒", "卫生", "干净", "毛巾", "工具消毒"],
+                "answer": "我们严格执行一客一换一消毒：毛巾一客一换，工具每次使用前后都经过紫外线+酒精双重消毒，房间每客结束后通风消毒。您可以放心～",
+            },
+            {
+                "question": "会员卡有什么优惠",
+                "keywords": ["会员优惠", "会员卡优惠", "办卡优惠", "卡有什么好处", "会员权益", "会员卡好处", "会员卡有什么"],
+                "answer": "我们提供储值卡、次卡、年卡、季卡、月卡五种。储值卡充得多送得多，次卡比单次省30-40%，年卡最划算适合长期保养的姐妹。第一次办卡还有新客福利～您想了解哪种卡？",
+            },
+            {
+                "question": "可以分期付款吗",
+                "keywords": ["分期", "花呗", "信用卡", "付款方式", "怎么付"],
+                "answer": "支持微信/支付宝/银行卡支付。大额消费可以刷信用卡，具体分期政策请到店咨询前台～",
+            },
+            {
+                "question": "染发后怎么护理/掉色怎么办",
+                "keywords": ["染发护理", "染发后", "掉色", "褪色", "染后护理", "颜色掉了", "染完怎么弄", "染发打理"],
+                "answer": "染发后护理三要点：①48小时内不要洗头，让颜色稳定 ②用护色洗发水，不要用去屑/强力清洁型 ③减少热工具（夹板/吹风机高温）使用。掉色是正常现象，生活色/微潮色比夸张色系掉色更慢，6-8周补染一次即可。",
+            },
+            {
+                "question": "烫发后怎么护理",
+                "keywords": ["烫发护理", "烫后护理", "烫完怎么弄", "烫发打理", "烫完打理", "烫发后"],
+                "answer": "烫发后护理：①48小时内不要洗头、不要扎发 ③用弹力素/卷发乳打理，不要用密齿梳 ③吹头发用扩散风嘴，不要用强风直吹 ④定期做发膜深层护理。免打理烫型的话，大风吹干就能出门，非常省事～",
+            },
+            {
+                "question": "接发能维持多久",
+                "keywords": ["接发", "接头发", "维持多久"],
+                "answer": "接发一般能维持2-3个月，取决于头发生长速度和日常护理。接发后注意：洗头时轻柔、不要用力梳、睡觉时松松扎一下避免打结。我们用的是优质发丝，自然度很高，看不出来是接的～",
+            },
+        ]

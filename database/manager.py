@@ -27,10 +27,12 @@ from .entity_repos import (
     ServiceTypeRepository, ProductRepository, ChannelRepository
 )
 from .business_repos import (
-    ServiceRecordRepository, ProductSaleRepository, MembershipRepository
+    ServiceRecordRepository, ProductSaleRepository, MembershipRepository,
+    AppointmentRepository
 )
 from .system_repos import (
-    MessageRepository, SummaryRepository, PluginRepository
+    MessageRepository, SummaryRepository, PluginRepository,
+    ChatMessageRepository
 )
 from .models import Employee, Membership
 
@@ -101,6 +103,10 @@ class DatabaseManager:
         self.summaries = SummaryRepository(self.conn)
         self.plugins = PluginRepository(self.conn)
 
+        # 预约与会话消息仓库
+        self.appointments = AppointmentRepository(self.conn)
+        self.chat_messages = ChatMessageRepository(self.conn)
+
     # ================================================================
     # 基础设施方法
     # ================================================================
@@ -150,6 +156,26 @@ class DatabaseManager:
     # ================================================================
     # 便捷写入方法
     # ================================================================
+
+    def create_appointment(self, **kwargs) -> Any:
+        """创建预约（参数见 AppointmentRepository.create_appointment）。"""
+        return self.appointments.create_appointment(**kwargs)
+
+    def list_appointments(self, **kwargs) -> list:
+        """查询预约列表（参数见 AppointmentRepository.list_appointments）。"""
+        return self.appointments.list_appointments(**kwargs)
+
+    def save_chat_message(self, **kwargs) -> int:
+        """保存会话消息（参数见 ChatMessageRepository.save_chat_message）。"""
+        return self.chat_messages.save_chat_message(**kwargs)
+
+    def get_chat_sessions(self, limit: int = 20) -> list:
+        """会话概要列表（参数见 ChatMessageRepository.get_chat_sessions）。"""
+        return self.chat_messages.get_chat_sessions(limit=limit)
+
+    def get_chat_messages(self, **kwargs) -> list:
+        """查询会话消息（参数见 ChatMessageRepository.get_chat_messages）。"""
+        return self.chat_messages.get_chat_messages(**kwargs)
 
     def save_raw_message(self, msg_data: Dict[str, Any]) -> int:
         """保存原始消息（自动去重）。

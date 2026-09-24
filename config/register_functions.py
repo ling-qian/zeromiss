@@ -90,7 +90,7 @@ def register_all_functions(registry: FunctionRegistry) -> None:
 
     registry.register(
         "open_membership",
-        "为顾客开通会员卡/疗程卡/储值卡。需要顾客姓名、卡类型和充值金额。",
+        "为顾客开通会员卡/疗程卡/储值卡/次卡。储值卡充值自动按档位赠送（充500送50/充1000送150/充2000送400）；开次卡必须指定总次数。",
         bf.open_membership,
         {
             "type": "object",
@@ -100,7 +100,8 @@ def register_all_functions(registry: FunctionRegistry) -> None:
                     "type": "string",
                     "description": "卡类型：年卡、季卡、月卡、次卡、疗程卡、储值卡",
                 },
-                "amount": {"type": "number", "description": "充值金额（元）"},
+                "amount": {"type": "number", "description": "充值/购卡金额（元）"},
+                "sessions": {"type": "integer", "description": "次卡/疗程卡总次数，开次卡时必填"},
                 "date_str": {"type": "string", "description": "开卡日期，格式YYYY-MM-DD，默认今天"},
             },
             "required": ["customer_name", "card_type", "amount"],
@@ -144,6 +145,49 @@ def register_all_functions(registry: FunctionRegistry) -> None:
                 "amount": {"type": "number", "description": "扣减金额（元）"},
             },
             "required": ["membership_id", "amount"],
+        },
+    )
+
+    registry.register(
+        "redeem_session",
+        "次卡/疗程卡核销扣次：顾客用次卡消费一次，扣减1次剩余次数。",
+        bf.redeem_session,
+        {
+            "type": "object",
+            "properties": {
+                "membership_id": {"type": "integer", "description": "会员卡ID"},
+                "service_name": {"type": "string", "description": "本次使用的服务名称（可选）"},
+            },
+            "required": ["membership_id"],
+        },
+    )
+
+    registry.register(
+        "refund_membership",
+        "会员卡退卡退款。7天内未消费全额退（冷静期）；超过7天退剩余余额，已消费部分按会员成交价计算，不按原价倒扣。",
+        bf.refund_membership,
+        {
+            "type": "object",
+            "properties": {
+                "membership_id": {"type": "integer", "description": "会员卡ID"},
+                "reason": {"type": "string", "description": "退卡原因（可选）"},
+            },
+            "required": ["membership_id"],
+        },
+    )
+
+    registry.register(
+        "redeem_points",
+        "积分兑换：将会员积分按100积分=10元折算成余额计入会员卡。",
+        bf.redeem_points,
+        {
+            "type": "object",
+            "properties": {
+                "customer_name": {"type": "string", "description": "顾客姓名"},
+                "points": {"type": "integer", "description": "兑换积分（100的整数倍）"},
+                "item": {"type": "string", "description": "兑换说明（可选）"},
+            },
+            "required": ["customer_name", "points"],
         },
     )
 
@@ -467,3 +511,54 @@ def register_all_functions(registry: FunctionRegistry) -> None:
     )
 
 
+
+    # ---------- 预约 ----------
+    registry.register(
+        "create_appointment",
+        "创建预约记录。顾客提出预约服务时调用（如：明天下午两点剪发）。"
+        "日期需转成 YYYY-MM-DD（参考系统提示中的今天日期），时间转成24小时制 HH:MM。",
+        bf.create_appointment,
+        {
+            "type": "object",
+            "properties": {
+                "customer_name": {"type": "string", "description": "顾客姓名"},
+                "service_name": {"type": "string", "description": "预约的服务项目"},
+                "appointment_date": {
+                    "type": "string",
+                    "description": "预约日期 YYYY-MM-DD（如 2026-09-20），不传视为今天",
+                },
+                "appointment_time": {"type": "string", "description": "预约时间 HH:MM（如 14:30）"},
+                "phone": {"type": "string", "description": "联系电话（可选）"},
+                "notes": {"type": "string", "description": "备注（可选）"},
+            },
+            "required": ["customer_name", "service_name"],
+        },
+    )
+
+    registry.register(
+        "list_appointments",
+        "查询预约列表。顾客或店主问'明天/今天有什么预约'时调用。",
+        bf.list_appointments,
+        {
+            "type": "object",
+            "properties": {
+                "date_str": {"type": "string", "description": "查询某天的预约 YYYY-MM-DD（可选，不传查未来30天）"},
+                "status": {"type": "string", "description": "按状态过滤：pending/confirmed/completed/cancelled/no_show（可选）"},
+            },
+            "required": [],
+        },
+    )
+
+    registry.register(
+        "update_appointment_status",
+        "更新预约状态。顾客确认到店、取消预约或爽约时调用。",
+        bf.update_appointment_status,
+        {
+            "type": "object",
+            "properties": {
+                "appointment_id": {"type": "integer", "description": "预约ID"},
+                "new_status": {"type": "string", "description": "新状态：confirmed/completed/cancelled/no_show"},
+            },
+            "required": ["appointment_id", "new_status"],
+        },
+    )

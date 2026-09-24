@@ -50,12 +50,17 @@ def init_default_data(db):
                 session=session,
             )
 
-        # 创建产品
+        # 创建产品（含初始库存）
         for prod in business_config.get_products():
-            db.products.get_or_create(
+            p = db.products.get_or_create(
                 prod["name"], prod.get("category"), prod.get("unit_price"),
                 session=session,
             )
+            # 设置初始库存
+            initial_stock = prod.get("stock", 0)
+            if p.stock_quantity is None or p.stock_quantity == 0:
+                p.stock_quantity = initial_stock
+                p.low_stock_threshold = max(5, initial_stock // 5)  # 低库存阈值为库存的20%，最低5
 
         # 创建引流渠道
         for ch in business_config.get_channels():
@@ -91,22 +96,7 @@ async def create_agent(db):
     # 设置业务函数的数据库引用
     business_functions.set_db(db)
 
-    # 检查 API Key
-    if not settings.minimax_api_key:
-        logger.warning("未配置 MINIMAX_API_KEY，Agent 将不可用")
-        return None
 
-    try:
-        provider = create_provider(
-            "minimax",
-            api_key=settings.minimax_api_key,
-            model=settings.minimax_model,
-            base_url=settings.minimax_base_url,
-        )
-        logger.info(f"LLM Provider 创建成功: minimax ({settings.minimax_model})")
-    except Exception as e:
-        logger.warning(f"创建 LLM Provider 失败: {e}，将使用无 Agent 模式")
-        return None
 
     # 创建函数注册表并注册所有业务函数
     registry = FunctionRegistry()
@@ -114,6 +104,34 @@ async def create_agent(db):
 
     func_count = len(registry.list_functions())
     logger.info(f"已注册 {func_count} 个业务函数到 Agent")
+
+    # 根据 LLM_PROVIDER 配置创建对应的 Provider
+    provider_type = settings.llm_provider.lower()
+    if provider_type == "deepseek":
+        api_key = settings.deepseek_api_key
+        model = settings.deepseek_model
+        base_url = settings.deepseek_base_url
+        provider = create_provider("openai", api_key=api_key, model=model, base_url=base_url)
+        logger.info(f"使用 DeepSeek: model={model}")
+    elif provider_type == "minimax":
+        api_key = settings.minimax_api_key
+        model = settings.minimax_model
+        base_url = settings.minimax_base_url
+        provider = create_provider("minimax", api_key=api_key, model=model, base_url=base_url)
+        logger.info(f"使用 MiniMax: model={model}")
+    elif provider_type == "openai":
+        api_key = settings.openai_api_key
+        model = settings.openai_model
+        base_url = settings.openai_base_url
+        # 兼容所有 OpenAI API 格式的服务（包括第三方代理）
+        provider = create_provider("openai", api_key=api_key, model=model, base_url=base_url)
+        logger.info(f"使用 OpenAI兼容: model={model}, base_url={base_url}")
+    else:
+        raise ValueError(f"不支持的 LLM_PROVIDER: {provider_type}")
+
+    if not api_key:
+        logger.warning(f"API Key 未配置（provider={provider_type}），Agent 不可用")
+        return None
 
     # 获取系统提示词（由 business_config 动态生成）
     system_prompt = get_system_prompt()
@@ -165,6 +183,24 @@ async def main():
                         help="跳过默认业务数据初始化")
     args = parser.parse_args()
 
+    # ==================== 日志文件输出 ====================
+    # stderr 保留控制台输出；文件日志供门店部署后排查问题
+    # （rotation 10MB 防止撑爆磁盘，retention 30天自动清理）
+    from pathlib import Path
+    _log_dir = Path("logs")
+    _log_dir.mkdir(exist_ok=True)
+    logger.add(
+        _log_dir / "app_{time:YYYY-MM-DD}.log",
+        rotation="10 MB",
+        retention="30 days",
+        level="INFO",
+        encoding="utf-8",
+        enqueue=True,  # 多线程/异步安全
+        backtrace=False,  # 不泄漏内部路径细节到日志正文以外
+        diagnose=False,  # 生产环境不展开变量值（防敏感信息入日志）
+    )
+    logger.info("日志文件输出已启用: logs/ 目录, 单文件上限10MB, 保留30天")
+
     # 用于 finally 清理的引用
     web = None
     db = None
@@ -197,6 +233,13 @@ async def main():
         from interface.base import Message, MessageType, Reply
         from config.business_config import business_config
 
+        def _iter_channels():
+            """遍历当前活跃通道（供转人工通知等场景使用）。"""
+            chs = []
+            if wechat_channel:
+                chs.append(wechat_channel)
+            return chs
+
         async def message_handler(message: Message):
             """处理用户消息
 
@@ -205,8 +248,64 @@ async def main():
             """
             if agent:
                 try:
-                    response = await agent.chat(message.content)
+                    # 会话隔离：微信顾客/网页会话各自独立历史，防跨顾客污染
+                    response = await agent.chat(
+                        message.content, session_id=message.session_id
+                    )
                     content = response.get("content", "抱歉，我无法处理你的请求。")
+                    needs_human = bool(response.get("needs_human"))
+
+                    # 消息流存档：顾客发来的 + AI回复的（店主看板可见，转人工标红）
+                    try:
+                        db.save_chat_message(
+                            session_id=message.session_id,
+                            direction="in",
+                            content=message.content,
+                            sender_name=message.sender_name or message.sender_id or None,
+                            channel=message.channel_name or None,
+                        )
+                        db.save_chat_message(
+                            session_id=message.session_id,
+                            direction="out",
+                            content=content,
+                            sender_name="AI助手",
+                            channel=message.channel_name or None,
+                            needs_human=needs_human,
+                        )
+                    except Exception as log_err:
+                        logger.warning(f"会话消息存档失败（不影响回复）: {log_err}")
+
+                    # 转人工：企微通知店主
+                    if needs_human:
+                        logger.info(f"会话 {message.session_id} 需要人工介入")
+                        notify = None
+                        try:
+                            from interface.wechat.channel import WeChatChannel
+                            notify = next(
+                                (ch for ch in _iter_channels()
+                                 if isinstance(ch, WeChatChannel)),
+                                None,
+                            )
+                        except Exception:
+                            notify = None
+                        if notify:
+                            try:
+                                snippet = message.content[:60]
+                                reply_snippet = content[:80]
+                                await notify.notify_owner(
+                                    f"【需人工介入】顾客「{message.sender_id}」"
+                                    f"说：{snippet}\nAI已回复：{reply_snippet}\n"
+                                    f"请及时跟进。"
+                                )
+                            except Exception as push_err:
+                                logger.warning(f"店主通知失败: {push_err}")
+
+                        # 分级授权：微信客服会话进入人工接管期（AI 静默，防与店主打架）
+                        try:
+                            if kf_channel is not None:
+                                kf_channel.set_human_hold(message.session_id)
+                        except Exception:
+                            pass
 
                     # 记录工具调用情况
                     if response.get("function_calls"):
@@ -218,10 +317,11 @@ async def main():
                         content=content,
                     )
                 except Exception as e:
-                    logger.error(f"Agent 处理出错: {e}")
+                    # 对外只给通用话术，内部异常细节进日志（防泄漏路径/SQL/配置）
+                    logger.exception(f"Agent 处理出错 [session={message.session_id}]: {e}")
                     return Reply(
                         type=MessageType.TEXT,
-                        content=f"处理出错: {str(e)}",
+                        content="哎呀，我这边出了点小状况，请稍后再试或联系店主处理 🙏",
                     )
             else:
                 store_name = business_config.get_business_name()
@@ -249,11 +349,59 @@ async def main():
             db_manager=db,
         )
 
-        # 启动
+        # 启动 Web 通道
         await web.startup()
+
+        # ==================== 微信通道（可选） ====================
+        wechat_channel = None
+        wechat_mode = os.getenv("WECHAT_MODE", "").lower()
+        if wechat_mode in ("wecom", "webhook"):
+            try:
+                from interface.wechat.channel import create_wechat_channel_from_env
+                wechat_channel = create_wechat_channel_from_env()
+                if wechat_channel:
+                    wechat_channel.set_message_handler(message_handler)
+                    # 将微信路由挂载到 Web 通道的 FastAPI app 上
+                    wechat_channel._app = web.app
+                    await wechat_channel.startup()
+                    logger.info("微信通道已启动")
+            except Exception as e:
+                logger.warning(f"微信通道启动失败（不影响Web服务）: {e}")
+
+        # ==================== 微信客服通道（合规对外接待，可选） ====================
+        # 个人微信自动回复=外挂=封号红线；「微信客服」是腾讯官方认可的自动化接待通道。
+        # 配置 WECOM_CORP_ID / WECOM_KF_SECRET / WECOM_KF_OPEN_KFID / WECOM_KF_TOKEN / WECOM_KF_AES_KEY 后启用。
+        kf_channel = None
+        if wechat_mode == "kf":
+            try:
+                from interface.wechat.kf_channel import create_kf_channel_from_env
+                kf_channel = create_kf_channel_from_env(message_handler, app=web.app)
+                if kf_channel:
+                    await kf_channel.startup()
+                    logger.info("微信客服通道已启动")
+            except Exception as e:
+                logger.warning(f"微信客服通道启动失败（不影响Web服务）: {e}")
+                kf_channel = None
 
         store_name = business_config.get_business_name()
         func_count = len(agent.function_registry.list_functions()) if agent else 0
+
+        # ==================== 数据库自动备份 ====================
+        backup_status_line = ""
+        try:
+            from database.backup import backup_database, start_backup_scheduler, get_backup_status
+            if db.database_url.startswith("sqlite"):
+                backup_database(db)  # 启动时立即备份一次
+                await start_backup_scheduler(db)  # 每日 02:00 自动备份
+                status = get_backup_status()
+                if status:
+                    backup_status_line = f"  Backup:    {status['time']} ({status['size_kb']} KB) ✅\n"
+        except Exception as e:
+            logger.warning(f"备份初始化失败（不影响主服务）: {e}")
+
+        wechat_label = ""
+        if wechat_channel:
+            wechat_label = f"  WeChat:    {'企业微信' if wechat_channel.mode == 'wecom' else 'Webhook'} ✅\n"
 
         print()
         print("=" * 60)
@@ -266,6 +414,13 @@ async def main():
         print(f"  Agent:     {'✅ enabled' if agent else '❌ disabled (set MINIMAX_API_KEY)'}")
         if agent:
             print(f"  Functions: {func_count} registered")
+        if wechat_label:
+            print(wechat_label, end="")
+        if backup_status_line:
+            print(backup_status_line, end="")
+        if args.password == "admin123" or args.username == "admin":
+            print("  ⚠️  当前使用默认账号密码，公网部署前请修改！")
+            print("     启动参数示例: python app.py --username boss --password 你的强密码")
         print(f"  Config:    config/business_config.py")
         print("=" * 60)
         print("  Press Ctrl+C to stop")

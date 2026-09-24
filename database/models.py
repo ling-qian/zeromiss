@@ -89,8 +89,8 @@ class Customer(Base):
     __tablename__ = "customers"
     
     id: int = Column(Integer, primary_key=True, autoincrement=True)
-    name: str = Column(String(50), nullable=False)
-    phone: Optional[str] = Column(String(20))
+    name: str = Column(String(50), nullable=False, index=True)
+    phone: Optional[str] = Column(String(20), index=True)
     notes: Optional[str] = Column(Text)
     extra_data: Dict[str, Any] = Column(JSON, default={})  # 扩展数据：VIP等级、来源渠道、标签等
     created_at: datetime = Column(DateTime, default=datetime.utcnow)
@@ -249,11 +249,11 @@ class ServiceRecord(Base):
     __tablename__ = "service_records"
     
     id: int = Column(Integer, primary_key=True, autoincrement=True)
-    customer_id: Optional[int] = Column(Integer, ForeignKey("customers.id"))
-    employee_id: Optional[int] = Column(Integer, ForeignKey("employees.id"))
+    customer_id: Optional[int] = Column(Integer, ForeignKey("customers.id"), index=True)
+    employee_id: Optional[int] = Column(Integer, ForeignKey("employees.id"), index=True)
     recorder_id: Optional[int] = Column(Integer, ForeignKey("employees.id"))
     service_type_id: Optional[int] = Column(Integer, ForeignKey("service_types.id"))
-    service_date: date = Column(Date, nullable=False)
+    service_date: date = Column(Date, nullable=False, index=True)
     amount: float = Column(DECIMAL(10, 2), nullable=False)
     commission_amount: float = Column(DECIMAL(10, 2), default=0)
     commission_to: Optional[str] = Column(String(50))  # 保留用于向后兼容，推荐使用referral_channel_id
@@ -344,12 +344,12 @@ class ProductSale(Base):
     
     id: int = Column(Integer, primary_key=True, autoincrement=True)
     product_id: Optional[int] = Column(Integer, ForeignKey("products.id"))
-    customer_id: Optional[int] = Column(Integer, ForeignKey("customers.id"))
+    customer_id: Optional[int] = Column(Integer, ForeignKey("customers.id"), index=True)
     recorder_id: Optional[int] = Column(Integer, ForeignKey("employees.id"))
     quantity: int = Column(Integer, default=1)
     unit_price: Optional[float] = Column(DECIMAL(10, 2))
     total_amount: float = Column(DECIMAL(10, 2), nullable=False)
-    sale_date: date = Column(Date, nullable=False)
+    sale_date: date = Column(Date, nullable=False, index=True)
     notes: Optional[str] = Column(Text)
     raw_message_id: Optional[int] = Column(Integer, ForeignKey("raw_messages.id"))
     parse_confidence: Optional[float] = Column(DECIMAL(3, 2))
@@ -552,3 +552,65 @@ class PluginData(Base):
                         name='uq_plugin_data'),
     )
 
+
+
+class Appointment(Base):
+    """预约记录表模型。
+
+    存储顾客的预约信息，让AI的口头预约真正落库、可追踪、可提醒。
+    状态流转：pending（待确认）→ confirmed（已确认）→ completed（已完成）
+              / cancelled（已取消）/ no_show（爽约）。
+
+    Attributes:
+        id: 主键，自增整数。
+        customer_id: 顾客ID，外键关联customers表，可选（新顾客可能未建档）。
+        customer_name: 顾客姓名，必填，最大长度50字符（AI可直接用对话中的名字创建）。
+        phone: 联系电话，可选，最大长度20字符。
+        service_name: 预约的服务项目，必填，最大长度100字符。
+        appointment_date: 预约日期，必填。
+        appointment_time: 预约时间，可选，如"14:30"、"下午两点"存"14:00"。
+        status: 预约状态，默认pending，最大长度20字符。
+        notes: 备注，可选，文本类型。
+        created_at: 创建时间，自动设置为当前UTC时间。
+    """
+    __tablename__ = "appointments"
+
+    id: int = Column(Integer, primary_key=True, autoincrement=True)
+    customer_id: Optional[int] = Column(Integer, ForeignKey("customers.id"), index=True)
+    customer_name: str = Column(String(50), nullable=False, index=True)
+    phone: Optional[str] = Column(String(20))
+    service_name: str = Column(String(100), nullable=False)
+    appointment_date: date = Column(Date, nullable=False, index=True)
+    appointment_time: Optional[str] = Column(String(10))
+    status: str = Column(String(20), default="pending", index=True)
+    notes: Optional[str] = Column(Text)
+    created_at: datetime = Column(DateTime, default=datetime.utcnow)
+
+
+class ChatMessage(Base):
+    """会话消息存档表模型。
+
+    记录顾客与AI的每一条往来消息（入站in/出站out），供店主在看板
+    查看对话流——这是"AI回复靠不靠谱"的过程证据，也是转人工介入
+    的入口。与RawMessage（解析管道）职责不同，本表面向店主展示。
+
+    Attributes:
+        id: 主键，自增整数。
+        session_id: 会话标识，必填，最大长度100字符（如wx_{openid}）。
+        channel: 来源渠道，最大长度30字符（wechat-webhook/webchat等）。
+        direction: 方向，in=顾客发来 / out=AI回复，最大长度10字符。
+        sender_name: 发送者名称（顾客昵称或"AI助手"），最大长度100字符。
+        content: 消息内容，必填，文本类型。
+        needs_human: 是否需要人工介入（转人工标记），默认False。
+        created_at: 创建时间，自动设置为当前UTC时间。
+    """
+    __tablename__ = "chat_messages"
+
+    id: int = Column(Integer, primary_key=True, autoincrement=True)
+    session_id: str = Column(String(100), nullable=False, index=True)
+    channel: Optional[str] = Column(String(30))
+    direction: str = Column(String(10), nullable=False)  # in / out
+    sender_name: Optional[str] = Column(String(100))
+    content: str = Column(Text, nullable=False)
+    needs_human: bool = Column(Boolean, default=False)
+    created_at: datetime = Column(DateTime, default=datetime.utcnow)

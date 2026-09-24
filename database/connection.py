@@ -68,6 +68,14 @@ class DatabaseConnection:
                 echo=False,
                 connect_args={"check_same_thread": False}
             )
+            # SQLite 并发优化：WAL 模式（读写不互斥）+ 忙等待超时（防 database is locked）
+            from sqlalchemy import event as sa_event
+            @sa_event.listens_for(self.engine, "connect")
+            def _set_sqlite_pragma(dbapi_conn, _record):
+                cursor = dbapi_conn.cursor()
+                cursor.execute("PRAGMA busy_timeout=5000")
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.close()
             self.SessionLocal = sessionmaker(
                 bind=self.engine, autocommit=False, autoflush=False
             )
@@ -87,8 +95,32 @@ class DatabaseConnection:
 
         根据 models.py 中定义的所有模型创建对应的数据库表。
         如果表已存在则不会重复创建（幂等操作）。
+        另外为已有旧库补建查询索引（CREATE INDEX IF NOT EXISTS 幂等）。
         """
         Base.metadata.create_all(self.engine)
+        self._ensure_indexes()
+
+    def _ensure_indexes(self) -> None:
+        """为高频查询字段补建索引（对已存在的表，create_all 不会补索引）。
+
+        幂等：全部使用 IF NOT EXISTS，重复执行无害。
+        """
+        if not self.database_url.startswith("sqlite"):
+            return  # PostgreSQL 生产库建议由迁移脚本管理
+        idx_sql = [
+            "CREATE INDEX IF NOT EXISTS ix_customers_name ON customers (name)",
+            "CREATE INDEX IF NOT EXISTS ix_customers_phone ON customers (phone)",
+            "CREATE INDEX IF NOT EXISTS ix_service_records_service_date ON service_records (service_date)",
+            "CREATE INDEX IF NOT EXISTS ix_service_records_customer_id ON service_records (customer_id)",
+            "CREATE INDEX IF NOT EXISTS ix_service_records_employee_id ON service_records (employee_id)",
+            "CREATE INDEX IF NOT EXISTS ix_product_sales_sale_date ON product_sales (sale_date)",
+            "CREATE INDEX IF NOT EXISTS ix_product_sales_customer_id ON product_sales (customer_id)",
+            "CREATE INDEX IF NOT EXISTS ix_memberships_customer_id ON memberships (customer_id)",
+        ]
+        with self.get_session() as session:
+            for sql in idx_sql:
+                session.execute(text(sql))
+            session.commit()
 
     def get_session(self) -> Union[Session, AsyncSession]:
         """获取数据库会话。

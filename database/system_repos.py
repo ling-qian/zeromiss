@@ -11,7 +11,7 @@ from loguru import logger
 from .base_crud import BaseCRUD
 from .connection import DatabaseConnection
 from .models import (
-    RawMessage, Correction, DailySummary, PluginData
+    RawMessage, Correction, DailySummary, PluginData, ChatMessage
 )
 
 
@@ -319,3 +319,118 @@ class PluginRepository(BaseCRUD):
             query.delete()
             session.commit()
 
+class ChatMessageRepository(BaseCRUD):
+    """会话消息存档仓库。
+
+    记录顾客与AI的往来消息（in/out），供店主查看对话流和转人工跟进。
+    """
+
+    def __init__(self, conn: DatabaseConnection) -> None:
+        super().__init__(conn)
+
+    def save_chat_message(
+        self,
+        session_id: str,
+        direction: str,
+        content: str,
+        sender_name: Optional[str] = None,
+        channel: Optional[str] = None,
+        needs_human: bool = False,
+    ) -> int:
+        """保存一条会话消息。
+
+        Args:
+            session_id: 会话标识（必填）。
+            direction: 方向 in/out（必填）。
+            content: 消息内容（必填）。
+            sender_name: 发送者名称（可选）。
+            channel: 来源渠道（可选）。
+            needs_human: 是否需要人工介入（可选）。
+
+        Returns:
+            消息ID。
+        """
+        if direction not in ("in", "out"):
+            raise ValueError(f"direction必须是in/out，收到: {direction}")
+        if not content:
+            raise ValueError("消息内容不能为空")
+        with self._get_session() as sess:
+            msg = ChatMessage(
+                session_id=str(session_id),
+                channel=channel,
+                direction=direction,
+                sender_name=sender_name,
+                content=str(content),
+                needs_human=bool(needs_human),
+            )
+            sess.add(msg)
+            sess.commit()
+            return msg.id
+
+    def get_chat_messages(
+        self,
+        session_id: Optional[str] = None,
+        needs_human: Optional[bool] = None,
+        limit: int = 100,
+    ) -> List[ChatMessage]:
+        """查询消息（时间正序），按会话过滤或取全部。
+
+        Args:
+            session_id: 会话标识，None时取全部会话。
+            needs_human: 是否只看需人工介入的消息。
+            limit: 返回上限，默认100（最多500）。
+        """
+        limit = min(int(limit), 500)
+        with self._get_session() as sess:
+            q = sess.query(ChatMessage)
+            if session_id:
+                q = q.filter(ChatMessage.session_id == session_id)
+            if needs_human is not None:
+                q = q.filter(ChatMessage.needs_human == needs_human)
+            rows = (
+                q.order_by(ChatMessage.id.desc())
+                .limit(limit).all()
+            )
+            return list(reversed(rows))
+
+    def get_chat_sessions(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """会话列表：每个会话的概要（最后一条消息+未处理人工标记数）。
+
+        Args:
+            limit: 返回会话数上限，默认20。
+
+        Returns:
+            [{session_id, sender_name, last_content, last_direction,
+              last_time, message_count, needs_human_count}]，按最新排序。
+        """
+        from sqlalchemy import func, case as sql_case
+        with self._get_session() as sess:
+            sub = (
+                sess.query(
+                    ChatMessage.session_id,
+                    func.max(ChatMessage.id).label("last_id"),
+                    func.count(ChatMessage.id).label("message_count"),
+                    func.sum(sql_case((ChatMessage.needs_human == True, 1), else_=0)).label("needs_human_count"),
+                )
+                .group_by(ChatMessage.session_id)
+                .subquery()
+            )
+            rows = (
+                sess.query(ChatMessage, sub.c.message_count, sub.c.needs_human_count)
+                .join(sub, ChatMessage.id == sub.c.last_id)
+                .order_by(ChatMessage.id.desc())
+                .limit(limit)
+                .all()
+            )
+            out = []
+            for msg, count, nh_count in rows:
+                out.append({
+                    "session_id": msg.session_id,
+                    "sender_name": msg.sender_name,
+                    "last_content": (msg.content[:80] if msg.content else ""),
+                    "last_direction": msg.direction,
+                    "last_time": msg.created_at.isoformat() if msg.created_at else None,
+                    "message_count": int(count or 0),
+                    "needs_human_count": int(nh_count or 0),
+                })
+            return out

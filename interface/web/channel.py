@@ -18,6 +18,7 @@ import json
 import secrets
 import signal as signal_module
 import threading
+import time
 import uuid
 from datetime import datetime, date, timedelta
 from decimal import Decimal
@@ -81,6 +82,35 @@ class WebChannel(Channel):
         self._server_loop = None  # 服务器事件循环
         # 简易 token 存储
         self._valid_tokens: Dict[str, datetime] = {}
+        # 登录防爆破：IP → 失败时间戳列表；5 次失败锁 10 分钟
+        self._login_attempts: Dict[str, List[float]] = {}
+        self._login_lock_secs: float = 600.0
+        self._login_max_attempts: int = 5
+
+    def _login_blocked(self, ip: str) -> float:
+        """检查 IP 是否被锁定。返回剩余锁定秒数，0 表示未锁。"""
+        now = time.time()
+        fails = [t for t in self._login_attempts.get(ip, [])
+                 if now - t < self._login_lock_secs]
+        self._login_attempts[ip] = fails
+        if len(fails) >= self._login_max_attempts:
+            oldest = min(fails)
+            return max(0.0, self._login_lock_secs - (now - oldest))
+        return 0.0
+
+    def _record_login_fail(self, ip: str) -> None:
+        """记录一次登录失败。"""
+        now = time.time()
+        fails = [t for t in self._login_attempts.get(ip, [])
+                 if now - t < self._login_lock_secs]
+        fails.append(now)
+        self._login_attempts[ip] = fails
+        if len(fails) >= self._login_max_attempts:
+            logger.warning(f"[Web] 登录失败达上限，IP {ip} 已锁定10分钟")
+
+    def _record_login_success(self, ip: str) -> None:
+        """登录成功，清除该 IP 失败记录。"""
+        self._login_attempts.pop(ip, None)
 
     def _generate_token(self) -> str:
         """生成登录 token"""
@@ -103,7 +133,7 @@ class WebChannel(Channel):
         from fastapi.responses import HTMLResponse, JSONResponse
 
         app = FastAPI(
-            title="商业管理平台",
+            title="美业AI店长助手",
             description="Web 管理平台 - 聊天 + 数据库可视化",
             version="3.0.0",
         )
@@ -127,13 +157,24 @@ class WebChannel(Channel):
         # ==================== 认证 API ====================
 
         @app.post("/api/login")
-        async def login(data: dict):
-            """登录认证"""
+        async def login(request: Request, data: dict):
+            """登录认证（带防爆破：5次失败锁定10分钟）"""
+            client_ip = request.client.host if request.client else "unknown"
+            blocked = self._login_blocked(client_ip)
+            if blocked > 0:
+                return JSONResponse(
+                    status_code=429,
+                    content={"success": False,
+                             "error": f"尝试次数过多，请 {int(blocked // 60) + 1} 分钟后再试"},
+                )
             username = data.get("username", "")
             password = data.get("password", "")
             if username == self.username and password == self.password:
+                self._record_login_success(client_ip)
                 token = self._generate_token()
                 return {"success": True, "token": token}
+            self._record_login_fail(client_ip)
+            logger.warning(f"[Web] 登录失败 user={username!r} ip={client_ip}")
             return JSONResponse(
                 status_code=401,
                 content={"success": False, "error": "用户名或密码错误"},
@@ -170,10 +211,11 @@ class WebChannel(Channel):
                 else:
                     return {"reply": "抱歉，我暂时无法处理你的请求。", "type": "text"}
             except Exception as e:
-                logger.error(f"Web 聊天处理出错: {e}")
+                # 对外只给通用话术，内部异常细节进日志（防泄漏路径/SQL/配置）
+                logger.exception(f"Web 聊天处理出错 [session={session_id}]: {e}")
                 return JSONResponse(
                     status_code=500,
-                    content={"error": f"处理出错: {str(e)}"},
+                    content={"error": "哎呀，我这边出了点小状况，请稍后再试 🙏"},
                 )
 
         # ==================== 数据库 API ====================
@@ -207,14 +249,80 @@ class WebChannel(Channel):
                         "count": len(records),
                     })
 
+                # 数据备份状态（每天自动备份，给店主安全感也是卖点）
+                backup_info = None
+                try:
+                    from database.backup import get_backup_status
+                    backup_info = get_backup_status()
+                except Exception:
+                    pass
+
                 return {
                     "today_revenue": today_revenue,
                     "today_count": today_count,
                     "staff_count": len(staff_list),
                     "weekly_data": weekly_data,
+                    "backup": backup_info,
                 }
             except Exception as e:
                 logger.error(f"获取仪表盘数据出错: {e}")
+                return {"error": str(e)}
+
+        @app.get("/api/ai_contributions")
+        async def ai_contributions(_=Depends(get_current_user)):
+            """AI店长本月功劳簿 —— 把产品价值量化透出给老板"""
+            if not self.db_manager:
+                return {"error": "数据库未连接"}
+            from database.models import (
+                ServiceRecord, ProductSale, Membership, Product,
+            )
+            db = self.db_manager
+            today = date.today()
+            month_start = today.replace(day=1)
+            try:
+                with db.get_session() as session:
+                    # 本月记录的经营流水（服务+产品销售）
+                    svc_count = session.query(ServiceRecord).filter(
+                        ServiceRecord.service_date >= month_start
+                    ).count()
+                    sale_count = session.query(ProductSale).filter(
+                        ProductSale.sale_date >= month_start
+                    ).count()
+                    total_records = svc_count + sale_count
+
+                    # 本月新增会员卡数
+                    new_members = session.query(Membership).filter(
+                        Membership.opened_at >= month_start
+                    ).count()
+
+                    # 30天内到期且有余额的会员卡（涉及余额=召回机会）
+                    expiring_soon = 0
+                    expiring_balance = 0.0
+                    for m in session.query(Membership).filter(
+                        Membership.is_active == True  # noqa: E712
+                    ).all():
+                        if m.expires_at and month_start <= m.expires_at <= today + timedelta(days=30):
+                            expiring_soon += 1
+                            expiring_balance += float(m.balance or 0)
+
+                    # 低库存产品数
+                    low_stock = session.query(Product).filter(
+                        Product.stock_quantity <= Product.low_stock_threshold
+                    ).count()
+
+                # 折算省时：每笔流水约1分钟手工记账时间
+                minutes_saved = total_records
+                return {
+                    "month_records": total_records,
+                    "minutes_saved": minutes_saved,
+                    "new_members": new_members,
+                    "expiring_soon": expiring_soon,
+                    "expiring_balance": round(expiring_balance, 2),
+                    "low_stock": low_stock,
+                    "month": today.strftime("%Y-%m"),
+                }
+            except Exception as e:
+                logger.error(f"获取功劳簿数据出错: {e}")
                 return {"error": str(e)}
 
         @app.get("/api/employees")
@@ -228,6 +336,101 @@ class WebChannel(Channel):
             except Exception as e:
                 logger.error(f"获取员工列表出错: {e}")
                 return {"data": [], "error": str(e)}
+
+        @app.get("/api/knowledge_base")
+        async def knowledge_base_stats(_=Depends(get_current_user)):
+            """知识库统计"""
+            try:
+                from agent.agent import get_knowledge_base
+                kb = get_knowledge_base()
+                if kb:
+                    return {"enabled": True, "stats": kb.get_stats()}
+                return {"enabled": False, "stats": {}}
+            except Exception as e:
+                logger.error(f"获取知识库统计出错: {e}")
+                return {"enabled": False, "error": str(e)}
+
+        @app.get("/api/knowledge_base/search")
+        async def knowledge_base_search(q: str = "", _=Depends(get_current_user)):
+            """知识库搜索"""
+            try:
+                from agent.agent import get_knowledge_base
+                kb = get_knowledge_base()
+                if kb and q:
+                    results = kb.search(q)
+                    return {"results": results}
+                return {"results": []}
+            except Exception as e:
+                logger.error(f"知识库搜索出错: {e}")
+                return {"results": [], "error": str(e)}
+
+        @app.get("/api/knowledge_base/items")
+        async def knowledge_base_items(
+            category: str = "", _=Depends(get_current_user)
+        ):
+            """知识库条目列表"""
+            try:
+                from agent.agent import get_knowledge_base
+                kb = get_knowledge_base()
+                if kb:
+                    cat = category if category else None
+                    items = kb.list_items(cat)
+                    return {"items": items}
+                return {"items": []}
+            except Exception as e:
+                logger.error(f"获取知识库条目出错: {e}")
+                return {"items": [], "error": str(e)}
+
+        @app.post("/api/knowledge_base/items")
+        async def knowledge_base_add(request: Request, _=Depends(get_current_user)):
+            """新增知识库条目"""
+            try:
+                from agent.agent import get_knowledge_base
+                kb = get_knowledge_base()
+                if not kb:
+                    return {"success": False, "error": "知识库未加载"}
+                body = await request.json()
+                category = body.get("category", "")
+                item = body.get("item", {})
+                ok = kb.add_item(category, item)
+                return {"success": ok}
+            except Exception as e:
+                logger.error(f"新增知识库条目出错: {e}")
+                return {"success": False, "error": str(e)}
+
+        @app.put("/api/knowledge_base/items")
+        async def knowledge_base_update(request: Request, _=Depends(get_current_user)):
+            """更新知识库条目"""
+            try:
+                from agent.agent import get_knowledge_base
+                kb = get_knowledge_base()
+                if not kb:
+                    return {"success": False, "error": "知识库未加载"}
+                body = await request.json()
+                category = body.get("category", "")
+                index = body.get("index", -1)
+                item = body.get("item", {})
+                ok = kb.update_item(category, index, item)
+                return {"success": ok}
+            except Exception as e:
+                logger.error(f"更新知识库条目出错: {e}")
+                return {"success": False, "error": str(e)}
+
+        @app.delete("/api/knowledge_base/items")
+        async def knowledge_base_delete(
+            category: str = "", index: int = -1, _=Depends(get_current_user)
+        ):
+            """删除知识库条目"""
+            try:
+                from agent.agent import get_knowledge_base
+                kb = get_knowledge_base()
+                if not kb:
+                    return {"success": False, "error": "知识库未加载"}
+                ok = kb.delete_item(category, index)
+                return {"success": ok}
+            except Exception as e:
+                logger.error(f"删除知识库条目出错: {e}")
+                return {"success": False, "error": str(e)}
 
         @app.get("/api/customers")
         async def customers_list(_=Depends(get_current_user)):
@@ -416,6 +619,98 @@ class WebChannel(Channel):
                 return {"data": data}
             except Exception as e:
                 logger.error(f"获取渠道列表出错: {e}")
+                return {"data": [], "error": str(e)}
+
+        # ==================== 预约管理 ====================
+
+        @app.get("/api/appointments")
+        async def appointments_list(
+            date: str = "", status: str = "", _=Depends(get_current_user)
+        ):
+            """预约列表（可按日期/状态过滤）"""
+            if not self.db_manager:
+                return {"data": [], "error": "数据库未连接"}
+            try:
+                from datetime import date as _date, timedelta
+                if date:
+                    d = _date.fromisoformat(date)
+                    rows = self.db_manager.list_appointments(target_date=d)
+                else:
+                    today = _date.today()
+                    rows = self.db_manager.list_appointments(
+                        start_date=today, end_date=today + timedelta(days=30)
+                    )
+                if status:
+                    rows = [r for r in rows if r.status == status]
+                data = [{
+                    "id": r.id,
+                    "customer_name": r.customer_name,
+                    "phone": r.phone or "",
+                    "service_name": r.service_name,
+                    "date": r.appointment_date.isoformat(),
+                    "time": r.appointment_time or "",
+                    "status": r.status,
+                    "notes": r.notes or "",
+                } for r in rows]
+                return {"data": data}
+            except Exception as e:
+                logger.error(f"获取预约列表出错: {e}")
+                return {"data": [], "error": str(e)}
+
+        @app.put("/api/appointments/{appointment_id}/status")
+        async def appointment_update_status(
+            appointment_id: int, payload: dict, _=Depends(get_current_user)
+        ):
+            """更新预约状态（店主手动确认/取消）"""
+            if not self.db_manager:
+                return {"success": False, "error": "数据库未连接"}
+            try:
+                new_status = str(payload.get("status", "")).strip()
+                appt = self.db_manager.appointments.update_status(
+                    appointment_id, new_status
+                )
+                if not appt:
+                    return {"success": False, "error": "预约不存在"}
+                return {"success": True, "status": appt.status}
+            except Exception as e:
+                logger.error(f"更新预约状态出错: {e}")
+                return {"success": False, "error": str(e)}
+
+        # ==================== 顾客消息流 ====================
+
+        @app.get("/api/chat_sessions")
+        async def chat_sessions(_=Depends(get_current_user)):
+            """会话列表（每个会话概要+待人工标记数）"""
+            if not self.db_manager:
+                return {"data": [], "error": "数据库未连接"}
+            try:
+                return {"data": self.db_manager.get_chat_sessions(limit=30)}
+            except Exception as e:
+                logger.error(f"获取会话列表出错: {e}")
+                return {"data": [], "error": str(e)}
+
+        @app.get("/api/chat_messages")
+        async def chat_messages(
+            session_id: str = "", limit: int = 100, _=Depends(get_current_user)
+        ):
+            """会话消息流（时间正序）"""
+            if not self.db_manager:
+                return {"data": [], "error": "数据库未连接"}
+            try:
+                rows = self.db_manager.get_chat_messages(
+                    session_id=session_id or None, limit=limit
+                )
+                return {"data": [{
+                    "id": r.id,
+                    "session_id": r.session_id,
+                    "direction": r.direction,
+                    "sender_name": r.sender_name or "",
+                    "content": r.content,
+                    "needs_human": bool(r.needs_human),
+                    "created_at": r.created_at.isoformat() if r.created_at else "",
+                } for r in rows]}
+            except Exception as e:
+                logger.error(f"获取会话消息出错: {e}")
                 return {"data": [], "error": str(e)}
 
         # ==================== 健康检查 ====================
@@ -621,17 +916,17 @@ APP_HTML = """<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>商业管理平台</title>
+    <title>美业AI店长助手</title>
     <style>
         :root {
-            --primary: #4f46e5;
-            --primary-light: #818cf8;
-            --primary-dark: #3730a3;
-            --bg: #f8fafc;
+            --primary: #e11d48;
+            --primary-light: #fb7185;
+            --primary-dark: #9f1239;
+            --bg: #fdf2f8;
             --card: #ffffff;
             --text: #1e293b;
             --text-secondary: #64748b;
-            --border: #e2e8f0;
+            --border: #fce7f3;
             --success: #22c55e;
             --warning: #f59e0b;
             --danger: #ef4444;
@@ -652,7 +947,7 @@ APP_HTML = """<!DOCTYPE html>
             align-items: center;
             justify-content: center;
             height: 100vh;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, #e11d48 0%, #be185d 50%, #9f1239 100%);
         }
         .login-card {
             background: white;
@@ -664,14 +959,21 @@ APP_HTML = """<!DOCTYPE html>
         .login-card h1 {
             font-size: 24px;
             text-align: center;
-            margin-bottom: 8px;
-            color: var(--text);
+            margin-bottom: 4px;
+            color: var(--primary-dark);
         }
         .login-card p {
             text-align: center;
             color: var(--text-secondary);
             margin-bottom: 32px;
             font-size: 14px;
+        }
+        .login-card .brand-sub {
+            text-align: center;
+            font-size: 12px;
+            color: var(--primary-light);
+            margin-bottom: 24px;
+            letter-spacing: 2px;
         }
         .form-group {
             margin-bottom: 20px;
@@ -923,6 +1225,14 @@ APP_HTML = """<!DOCTYPE html>
         .badge-success { background: #dcfce7; color: #166534; }
         .badge-warning { background: #fef3c7; color: #92400e; }
         .badge-danger { background: #fee2e2; color: #991b1b; }
+        .btn-mini {
+            padding: 3px 10px; margin: 1px 2px; font-size: 12px;
+            border: 1px solid var(--border-color); border-radius: 6px;
+            background: #fff; color: var(--text-primary); cursor: pointer;
+            transition: all .15s;
+        }
+        .btn-mini:hover { border-color: var(--primary-color); color: var(--primary-color); background: var(--bg-primary); }
+        .btn-mini-danger:hover { border-color: #dc2626; color: #dc2626; background: #fef2f2; }
         .empty-state {
             text-align: center;
             padding: 60px 20px;
@@ -1095,8 +1405,9 @@ APP_HTML = """<!DOCTYPE html>
     <!-- 登录页 -->
     <div class="login-page" id="loginPage">
         <div class="login-card">
-            <h1>商业管理平台</h1>
-            <p>请登录以访问管理系统</p>
+            <h1>✂️ 美业AI店长助手</h1>
+            <p>说人话，管门店 — 让开店更轻松</p>
+            <div class="brand-sub">价格透明 · 零推销 · 售后有保障</div>
             <div class="form-group">
                 <label>用户名</label>
                 <input type="text" id="loginUser" placeholder="请输入用户名" autocomplete="username">
@@ -1116,33 +1427,42 @@ APP_HTML = """<!DOCTYPE html>
         <!-- 侧边栏 -->
         <div class="sidebar">
             <div class="sidebar-header">
-                <h2>管理平台</h2>
-                <small>Business Manager</small>
+                <h2>✂️ 美业助手</h2>
+                <small>AI 店长管家</small>
             </div>
             <div class="sidebar-nav">
                 <div class="nav-item active" onclick="switchPage('dashboard')" data-page="dashboard">
-                    <span class="icon">📊</span><span>仪表盘</span>
+                    <span class="icon">📊</span><span>经营看板</span>
                 </div>
                 <div class="nav-item" onclick="switchPage('chat')" data-page="chat">
-                    <span class="icon">💬</span><span>AI 助手</span>
+                    <span class="icon">💬</span><span>AI 店长</span>
                 </div>
                 <div class="nav-item" onclick="switchPage('employees')" data-page="employees">
-                    <span class="icon">👥</span><span>员工管理</span>
+                    <span class="icon">👩‍🎨</span><span>技师管理</span>
                 </div>
                 <div class="nav-item" onclick="switchPage('customers')" data-page="customers">
-                    <span class="icon">🧑‍🤝‍🧑</span><span>顾客管理</span>
+                    <span class="icon">🧑‍🤝‍🧑</span><span>顾客档案</span>
                 </div>
                 <div class="nav-item" onclick="switchPage('services')" data-page="services">
-                    <span class="icon">🛎️</span><span>服务记录</span>
+                    <span class="icon">💇</span><span>服务记录</span>
                 </div>
                 <div class="nav-item" onclick="switchPage('sales')" data-page="sales">
-                    <span class="icon">🛒</span><span>商品销售</span>
+                    <span class="icon">🛍️</span><span>产品销售</span>
                 </div>
                 <div class="nav-item" onclick="switchPage('memberships')" data-page="memberships">
-                    <span class="icon">💳</span><span>会员卡</span>
+                    <span class="icon">💎</span><span>会员管理</span>
                 </div>
                 <div class="nav-item" onclick="switchPage('products')" data-page="products">
-                    <span class="icon">📦</span><span>商品库存</span>
+                    <span class="icon">📦</span><span>库存管理</span>
+                </div>
+                <div class="nav-item" onclick="switchPage('knowledge')" data-page="knowledge">
+                    <span class="icon">📚</span><span>知识库</span>
+                </div>
+                <div class="nav-item" onclick="switchPage('appointments')" data-page="appointments">
+                    <span class="icon">📅</span><span>预约管理</span>
+                </div>
+                <div class="nav-item" onclick="switchPage('msgstream')" data-page="msgstream">
+                    <span class="icon">🗨️</span><span>顾客消息流</span>
                 </div>
             </div>
             <div class="sidebar-footer">
@@ -1155,26 +1475,42 @@ APP_HTML = """<!DOCTYPE html>
             <!-- 仪表盘页 -->
             <div class="page active" id="page-dashboard">
                 <div class="content-header">
-                    <h1>仪表盘</h1>
+                    <h1>📊 经营看板</h1>
                     <span id="dashboardDate" style="color: var(--text-secondary); font-size: 14px;"></span>
+                    <span id="backupStatus" style="color: var(--text-secondary); font-size: 13px; margin-left: auto;"></span>
                 </div>
                 <div class="content-body">
+                    <div id="onboardingBar" style="display:none; background: linear-gradient(135deg, #fff1f4, #ffe4ec); border: 1px solid var(--primary-light, #fce7f3); border-radius: 12px; padding: 14px 18px; margin-bottom: 16px;">
+                        <strong>👋 3步上手：</strong>
+                        ① 去 <a href="javascript:void(0)" onclick="switchPage('chat')">AI店长</a> 说「帮我记一笔张姐剪发38块」
+                        → ② 回到这里看营收
+                        → ③ 在 <a href="javascript:void(0)" onclick="switchPage('memberships')">会员管理</a> 给熟客开张储值卡
+                    </div>
                     <div class="stats-grid">
                         <div class="stat-card">
-                            <div class="label">今日营收</div>
+                            <div class="label">💰 今日营收</div>
                             <div class="value">¥<span id="todayRevenue">0</span></div>
                         </div>
                         <div class="stat-card">
-                            <div class="label">今日订单</div>
-                            <div class="value"><span id="todayCount">0</span><span class="unit">笔</span></div>
+                            <div class="label">💇 今日服务</div>
+                            <div class="value"><span id="todayCount">0</span><span class="unit">单</span></div>
                         </div>
                         <div class="stat-card">
-                            <div class="label">在职员工</div>
+                            <div class="label">👩‍🎨 在岗技师</div>
                             <div class="value"><span id="staffCount">0</span><span class="unit">人</span></div>
                         </div>
                     </div>
+                    <div class="chart-card" style="border: 1px solid #fce7f3; background: linear-gradient(135deg, #fff, #fdf2f8);">
+                        <h3>✨ AI店长 <span id="contribMonth"></span> 功劳簿</h3>
+                        <div id="contributions" style="display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:12px; padding: 6px 0;">
+                            <div class="contrib-item">📝 本月帮你记录 <strong id="cbRecords">-</strong> 笔经营流水（约省 <strong id="cbHours">-</strong> 小时记账时间）</div>
+                            <div class="contrib-item">💎 新增会员 <strong id="cbMembers">-</strong> 位</div>
+                            <div class="contrib-item">⏰ 盯着 <strong id="cbExpiring">-</strong> 张卡30天内到期，涉及余额 <strong id="cbBalance">-</strong> 元，记得让AI店长提醒召回</div>
+                            <div class="contrib-item">📦 库存预警 <strong id="cbStock">-</strong> 项，避免断货</div>
+                        </div>
+                    </div>
                     <div class="chart-card">
-                        <h3>近7天营收趋势</h3>
+                        <h3>📈 近7天营收趋势</h3>
                         <div class="bar-chart" id="weeklyChart"></div>
                     </div>
                 </div>
@@ -1184,16 +1520,16 @@ APP_HTML = """<!DOCTYPE html>
             <div class="page" id="page-chat">
                 <div class="chat-layout">
                     <div class="content-header">
-                        <h1>AI 助手</h1>
+                        <h1>💬 AI 店长</h1>
                     </div>
                     <div class="chat-messages" id="chatMessages">
                         <div class="chat-msg bot">
                             <div class="chat-avatar">🤖</div>
-                            <div class="chat-bubble">你好！我是你的商业管理助手。你可以问我关于营业数据、会员信息、记账等问题，也可以直接告诉我需要录入的数据。</div>
+                            <div class="chat-bubble">你好！我是你的美业AI店长助手 ✂️ 你可以问我：今天营业额多少？阿杰做了几个客人？帮我记一笔李姐烫发198块。也可以查会员余额、管库存、看技师提成。说人话就行！</div>
                         </div>
                     </div>
                     <div class="chat-input-area">
-                        <textarea id="chatInput" placeholder="输入消息..." rows="1"
+                        <textarea id="chatInput" placeholder="说人话就行，比如：今天赚了多少？帮我记一笔..." rows="1"
                             onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChat();}"
                             oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,120)+'px'"></textarea>
                         <button class="chat-send-btn" id="chatSendBtn" onclick="sendChat()">发送</button>
@@ -1203,12 +1539,12 @@ APP_HTML = """<!DOCTYPE html>
 
             <!-- 员工页 -->
             <div class="page" id="page-employees">
-                <div class="content-header"><h1>员工管理</h1></div>
+                <div class="content-header"><h1>👩‍🎨 技师管理</h1></div>
                 <div class="content-body">
                     <div class="data-table-wrapper">
                         <table class="data-table">
                             <thead><tr>
-                                <th>ID</th><th>姓名</th><th>角色</th><th>提成率</th><th>状态</th>
+                                <th>ID</th><th>姓名</th><th>岗位</th><th>提成率</th><th>状态</th>
                             </tr></thead>
                             <tbody id="employeesBody"></tbody>
                         </table>
@@ -1218,8 +1554,11 @@ APP_HTML = """<!DOCTYPE html>
 
             <!-- 顾客页 -->
             <div class="page" id="page-customers">
-                <div class="content-header"><h1>顾客管理</h1></div>
+                <div class="content-header"><h1>🧑‍🤝‍🧑 顾客档案</h1></div>
                 <div class="content-body">
+                    <div style="display:flex; gap:10px; margin-bottom:14px;">
+                        <input id="customerSearch" oninput="renderCustomerTable()" placeholder="🔍 搜索姓名/电话/备注..." style="flex:0 0 260px; padding:8px 14px; border:1px solid var(--border-color); border-radius:8px; font-size:14px;">
+                    </div>
                     <div class="data-table-wrapper">
                         <table class="data-table">
                             <thead><tr>
@@ -1233,7 +1572,7 @@ APP_HTML = """<!DOCTYPE html>
 
             <!-- 服务记录页 -->
             <div class="page" id="page-services">
-                <div class="content-header"><h1>服务记录</h1></div>
+                <div class="content-header"><h1>💇 服务记录</h1></div>
                 <div class="content-body">
                     <div class="filter-bar">
                         <label>起始日期:</label>
@@ -1256,7 +1595,7 @@ APP_HTML = """<!DOCTYPE html>
 
             <!-- 商品销售页 -->
             <div class="page" id="page-sales">
-                <div class="content-header"><h1>商品销售</h1></div>
+                <div class="content-header"><h1>🛍️ 产品销售</h1></div>
                 <div class="content-body">
                     <div class="filter-bar">
                         <label>起始日期:</label>
@@ -1279,13 +1618,18 @@ APP_HTML = """<!DOCTYPE html>
 
             <!-- 会员卡页 -->
             <div class="page" id="page-memberships">
-                <div class="content-header"><h1>会员卡管理</h1></div>
+                <div class="content-header"><h1>💎 会员管理</h1></div>
                 <div class="content-body">
+                    <div id="memberAlertBar" style="display:none; background:#fff1f4; border:1px solid #fecdd3; border-radius:12px; padding:12px 18px; margin-bottom:14px; color:#9f1239;"></div>
+                    <div style="display:flex; gap:10px; margin-bottom:14px;">
+                        <input id="memberSearch" oninput="renderMemberTable()" placeholder="🔍 搜索顾客姓名/卡类型..." style="flex:0 0 260px; padding:8px 14px; border:1px solid var(--border-color); border-radius:8px; font-size:14px;">
+                        <span style="align-self:center; color:var(--text-secondary); font-size:13px;">操作按钮会把指令填到AI店长，你确认后执行</span>
+                    </div>
                     <div class="data-table-wrapper">
                         <table class="data-table">
                             <thead><tr>
                                 <th>ID</th><th>顾客</th><th>卡类型</th><th>总金额</th>
-                                <th>余额</th><th>剩余次数</th><th>积分</th><th>开卡日期</th><th>状态</th>
+                                <th>余额</th><th>剩余次数</th><th>积分</th><th>到期日</th><th>状态</th><th>操作</th>
                             </tr></thead>
                             <tbody id="membershipsBody"></tbody>
                         </table>
@@ -1295,7 +1639,7 @@ APP_HTML = """<!DOCTYPE html>
 
             <!-- 商品库存页 -->
             <div class="page" id="page-products">
-                <div class="content-header"><h1>商品库存</h1></div>
+                <div class="content-header"><h1>📦 库存管理</h1></div>
                 <div class="content-body">
                     <div class="data-table-wrapper">
                         <table class="data-table">
@@ -1303,6 +1647,98 @@ APP_HTML = """<!DOCTYPE html>
                                 <th>ID</th><th>名称</th><th>类别</th><th>单价</th><th>库存</th><th>低库存阈值</th>
                             </tr></thead>
                             <tbody id="productsBody"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 知识库管理页 -->
+                        <!-- 预约管理页 -->
+            <div class="page" id="page-appointments">
+                <div class="content-header">
+                    <h1>📅 预约管理</h1>
+                    <p>AI 记下的每个预约都在这里，不再靠脑子记</p>
+                </div>
+                <div class="card">
+                    <div style="display:flex;gap:12px;align-items:center;margin-bottom:12px;flex-wrap:wrap;">
+                        <label>日期 <input type="date" id="apptDate" onchange="loadAppointments()" style="padding:6px 10px;border:1px solid var(--border);border-radius:8px;"></label>
+                        <label>状态
+                            <select id="apptStatus" onchange="loadAppointments()" style="padding:6px 10px;border:1px solid var(--border);border-radius:8px;">
+                                <option value="">全部</option>
+                                <option value="pending">待确认</option>
+                                <option value="confirmed">已确认</option>
+                                <option value="completed">已完成</option>
+                                <option value="cancelled">已取消</option>
+                                <option value="no_show">爽约</option>
+                            </select>
+                        </label>
+                        <button onclick="document.getElementById('apptDate').value='';loadAppointments()" style="padding:6px 12px;border:1px solid var(--border);background:#fff;border-radius:8px;cursor:pointer;">查看未来30天</button>
+                    </div>
+                    <div id="apptTable"></div>
+                </div>
+            </div>
+
+            <!-- 顾客消息流页 -->
+            <div class="page" id="page-msgstream">
+                <div class="content-header">
+                    <h1>🗨️ 顾客消息流</h1>
+                    <p>顾客和 AI 的对话全程可见，需要你处理的会标红</p>
+                </div>
+                <div style="display:grid;grid-template-columns:280px 1fr;gap:16px;" id="msgStreamLayout">
+                    <div class="card" style="align-self:start;">
+                        <div id="sessionList"></div>
+                    </div>
+                    <div class="card">
+                        <div id="chatStream"><p style="color:var(--text-tertiary);">← 从左侧选择一个会话查看对话</p></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="page" id="page-knowledge">
+                <div class="content-header">
+                    <h1>📚 知识库管理</h1>
+                    <div style="display:flex;gap:8px;align-items:center;">
+                        <select id="kbCategory" onchange="loadKnowledge()" style="padding:6px 12px;border-radius:6px;border:1px solid var(--border-color);background:var(--bg-primary);color:var(--text-primary);">
+                            <option value="">全部分类</option>
+                            <option value="tuning">🔊 调频规则</option>
+                            <option value="faq">❓ FAQ</option>
+                            <option value="sop">📋 SOP</option>
+                            <option value="industry">💡 行业常识</option>
+                        </select>
+                        <input id="kbSearch" placeholder="搜索关键词..." onkeydown="if(event.key==='Enter')loadKnowledge()" style="padding:6px 12px;border-radius:6px;border:1px solid var(--border-color);background:var(--bg-primary);color:var(--text-primary);width:200px;">
+                        <button onclick="loadKnowledge()" style="padding:6px 14px;border-radius:6px;background:var(--accent);color:#fff;border:none;cursor:pointer;">搜索</button>
+                        <button onclick="showKbAddForm()" style="padding:6px 14px;border-radius:6px;background:#10b981;color:#fff;border:none;cursor:pointer;">+ 新增</button>
+                    </div>
+                </div>
+                <div class="content-body">
+                    <div id="kbStats" style="display:flex;gap:16px;margin-bottom:16px;"></div>
+                    <div id="kbAddForm" style="display:none;margin-bottom:16px;padding:16px;background:var(--bg-secondary);border-radius:8px;border:1px solid var(--border-color);">
+                        <h3 style="margin:0 0 12px;" id="kbAddFormTitle">新增知识库条目</h3>
+                        <div style="display:grid;grid-template-columns:120px 1fr;gap:8px;align-items:center;">
+                            <label>分类：</label>
+                            <select id="kbAddCategory" style="padding:6px;border-radius:4px;border:1px solid var(--border-color);background:var(--bg-primary);color:var(--text-primary);">
+                                <option value="faq">FAQ</option><option value="tuning">调频规则</option><option value="sop">SOP</option><option value="industry">行业常识</option>
+                            </select>
+                            <label>问题：</label>
+                            <input id="kbAddQuestion" placeholder="如：你们几点开门" style="padding:6px;border-radius:4px;border:1px solid var(--border-color);background:var(--bg-primary);color:var(--text-primary);">
+                            <label>关键词：</label>
+                            <input id="kbAddKeywords" placeholder="逗号分隔，如：营业时间,几点开门" style="padding:6px;border-radius:4px;border:1px solid var(--border-color);background:var(--bg-primary);color:var(--text-primary);">
+                            <label>回答：</label>
+                            <textarea id="kbAddAnswer" rows="3" placeholder="标准回答内容" style="padding:6px;border-radius:4px;border:1px solid var(--border-color);background:var(--bg-primary);color:var(--text-primary);"></textarea>
+                            <label>追问：</label>
+                            <input id="kbAddFollowup" placeholder="可选，推荐追问" style="padding:6px;border-radius:4px;border:1px solid var(--border-color);background:var(--bg-primary);color:var(--text-primary);">
+                        </div>
+                        <div style="margin-top:12px;display:flex;gap:8px;">
+                            <button onclick="doKbAdd()" style="padding:6px 16px;border-radius:6px;background:#10b981;color:#fff;border:none;cursor:pointer;">确认新增</button>
+                            <button onclick="document.getElementById('kbAddForm').style.display='none'" style="padding:6px 16px;border-radius:6px;background:var(--bg-primary);color:var(--text-primary);border:1px solid var(--border-color);cursor:pointer;">取消</button>
+                        </div>
+                    </div>
+                    <div class="data-table-wrapper">
+                        <table class="data-table">
+                            <thead><tr>
+                                <th style="width:40px">#</th><th style="width:60px">分类</th><th>问题</th><th>关键词</th><th>回答</th><th style="width:100px">操作</th>
+                            </tr></thead>
+                            <tbody id="kbBody"></tbody>
                         </table>
                     </div>
                 </div>
@@ -1334,6 +1770,97 @@ async function api(path, options = {}) {
         throw new Error('未授权');
     }
     return resp;
+}
+
+// ==================== 预约管理 ====================
+const APPT_STATUS_LABEL = {pending:'待确认', confirmed:'已确认', completed:'已完成', cancelled:'已取消', no_show:'爽约'};
+
+async function loadAppointments() {
+    try {
+        const date = document.getElementById('apptDate').value || '';
+        const status = document.getElementById('apptStatus').value || '';
+        const resp = await api(`/api/appointments?date=${encodeURIComponent(date)}&status=${encodeURIComponent(status)}`);
+        const j = await resp.json();
+        const rows = j.data || [];
+        if (!rows.length) {
+            document.getElementById('apptTable').innerHTML = '<p style="color:var(--text-tertiary);">暂无预约。顾客跟 AI 说"明天下午两点剪发"，AI 会自动记到这里。</p>';
+            return;
+        }
+        let html = '<table style="width:100%;border-collapse:collapse;"><tr style="text-align:left;color:var(--text-tertiary);font-size:13px;"><th style="padding:8px;">顾客</th><th style="padding:8px;">项目</th><th style="padding:8px;">日期</th><th style="padding:8px;">时间</th><th style="padding:8px;">状态</th><th style="padding:8px;">操作</th></tr>';
+        rows.forEach(r => {
+            const badge = r.status === 'pending' ? 'background:#fff7e6;color:#d46b08;'
+                : r.status === 'confirmed' ? 'background:#e6f7ff;color:#096dd9;'
+                : r.status === 'completed' ? 'background:#f6ffed;color:#389e0d;'
+                : 'background:#fff1f0;color:#cf1322;';
+            html += `<tr style="border-top:1px solid var(--border);"><td style="padding:10px 8px;">${esc(r.customer_name)}</td><td style="padding:10px 8px;">${esc(r.service_name)}</td><td style="padding:10px 8px;">${esc(r.date)}</td><td style="padding:10px 8px;">${esc(r.time)}</td><td style="padding:10px 8px;"><span style="padding:2px 10px;border-radius:10px;font-size:12px;${badge}">${APPT_STATUS_LABEL[r.status]||r.status}</span></td><td style="padding:10px 8px;">`;
+            if (r.status === 'pending') {
+                html += `<button onclick="setApptStatus(${r.id},'confirmed')" style="padding:4px 10px;margin-right:6px;cursor:pointer;border:1px solid #91caff;background:#e6f7ff;border-radius:6px;">确认</button>`;
+            }
+            if (r.status === 'pending' || r.status === 'confirmed') {
+                html += `<button onclick="setApptStatus(${r.id},'completed')" style="padding:4px 10px;margin-right:6px;cursor:pointer;border:1px solid #b7eb8f;background:#f6ffed;border-radius:6px;">完成</button>`;
+            }
+            html += `</td></tr>`;
+        });
+        html += '</table>';
+        document.getElementById('apptTable').innerHTML = html;
+    } catch (e) {
+        document.getElementById('apptTable').innerHTML = `<p style="color:#cf1322;">加载失败：${esc(String(e))}</p>`;
+    }
+}
+
+async function setApptStatus(id, status) {
+    try {
+        await api(`/api/appointments/${id}/status`, { method: 'PUT', body: JSON.stringify({ status }) });
+        loadAppointments();
+    } catch (e) { alert('操作失败：' + e); }
+}
+
+// ==================== 顾客消息流 ====================
+let currentSessionId = '';
+
+async function loadChatSessions() {
+    try {
+        const resp = await api('/api/chat_sessions');
+        const j = await resp.json();
+        const sessions = j.data || [];
+        const el = document.getElementById('sessionList');
+        if (!sessions.length) {
+            el.innerHTML = '<p style="color:var(--text-tertiary);">暂无对话。顾客在微信上发给 AI 的每条消息，都会出现在这里。</p>';
+            document.getElementById('chatStream').innerHTML = '';
+            return;
+        }
+        let html = sessions.map(s => {
+            const flag = s.needs_human_count > 0 ? '<span style="color:#cf1322;font-size:12px;">🔴 需人工×' + s.needs_human_count + '</span>' : '';
+            return `<div onclick="openSession('${esc(s.session_id)}')" style="padding:10px;border-bottom:1px solid var(--border);cursor:pointer;" onmouseover="this.style.background='var(--bg-hover)'" onmouseout="this.style.background=''">
+                <div style="display:flex;justify-content:space-between;"><b>${esc(s.sender_name || s.session_id)}</b><span style="color:var(--text-tertiary);font-size:12px;">${s.message_count}条</span></div>
+                <div style="color:var(--text-tertiary);font-size:13px;margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${s.last_direction==='out'?'AI: ':''}${esc(s.last_content)}</div>
+                <div style="margin-top:4px;">${flag}</div>
+            </div>`;
+        }).join('');
+        el.innerHTML = html;
+    } catch (e) {
+        document.getElementById('sessionList').innerHTML = `<p style="color:#cf1322;">加载失败：${esc(String(e))}</p>`;
+    }
+}
+
+async function openSession(sid) {
+    currentSessionId = sid;
+    try {
+        const resp = await api(`/api/chat_messages?session_id=${encodeURIComponent(sid)}&limit=100`);
+        const j = await resp.json();
+        const msgs = j.data || [];
+        const el = document.getElementById('chatStream');
+        if (!msgs.length) { el.innerHTML = '<p style="color:var(--text-tertiary);">该会话暂无消息</p>'; return; }
+        el.innerHTML = msgs.map(m => {
+            if (m.direction === 'in') {
+                return `<div style="margin-bottom:10px;"><span style="background:#f0f2f5;padding:8px 12px;border-radius:10px;display:inline-block;max-width:80%;">${esc(m.content)}</span><div style="color:var(--text-tertiary);font-size:11px;margin-top:2px;">${esc(m.sender_name||'顾客')} · ${esc(m.created_at)}</div></div>`;
+            }
+            const warn = m.needs_human ? '<div style="color:#cf1322;font-size:12px;margin-top:2px;">🔴 需要人工介入</div>' : '';
+            return `<div style="margin-bottom:10px;text-align:right;"><span style="background:#e6f7ff;padding:8px 12px;border-radius:10px;display:inline-block;max-width:80%;text-align:left;">${esc(m.content)}</span><div style="color:var(--text-tertiary);font-size:11px;margin-top:2px;">AI助手 · ${esc(m.created_at)}</div>${warn}</div>`;
+        }).join('');
+    } catch (e) {
+        document.getElementById('chatStream').innerHTML = `<p style="color:#cf1322;">加载失败：${esc(String(e))}</p>`;
+    }
 }
 
 // ==================== 登录 ====================
@@ -1397,6 +1924,9 @@ function switchPage(page) {
         sales: loadSales,
         memberships: loadMemberships,
         products: loadProducts,
+        knowledge: loadKnowledge,
+        appointments: loadAppointments,
+        msgstream: loadChatSessions,
     };
     if (loaders[page]) loaders[page]();
 }
@@ -1406,6 +1936,40 @@ async function loadDashboard() {
     document.getElementById('dashboardDate').textContent = new Date().toLocaleDateString('zh-CN', {
         year: 'numeric', month: 'long', day: 'numeric', weekday: 'long'
     });
+
+    // 数据备份状态（每日自动备份，让店主安心）
+    try {
+        const bResp = await api('/api/dashboard');
+        const bData = await bResp.json();
+        const el = document.getElementById('backupStatus');
+        if (el && bData.backup) {
+            el.textContent = `💾 数据已备份 ${bData.backup.time}`;
+        }
+    } catch(e) {}
+
+    // 新手引导：首次登录显示3步上手（localStorage 记录，只显示前3次）
+    try {
+        const seen = parseInt(localStorage.getItem('onboarding_seen') || '0');
+        if (seen < 3) {
+            document.getElementById('onboardingBar').style.display = 'block';
+            localStorage.setItem('onboarding_seen', String(seen + 1));
+        }
+    } catch(e) {}
+
+    // AI功劳簿
+    try {
+        const cResp = await api('/api/ai_contributions');
+        const c = await cResp.json();
+        if (!c.error) {
+            document.getElementById('contribMonth').textContent = c.month || '';
+            document.getElementById('cbRecords').textContent = c.month_records || 0;
+            document.getElementById('cbHours').textContent = (c.minutes_saved / 60).toFixed(1);
+            document.getElementById('cbMembers').textContent = c.new_members || 0;
+            document.getElementById('cbExpiring').textContent = c.expiring_soon || 0;
+            document.getElementById('cbBalance').textContent = (c.expiring_balance || 0).toLocaleString();
+            document.getElementById('cbStock').textContent = c.low_stock || 0;
+        }
+    } catch(e) { console.error(e); }
 
     try {
         const resp = await api('/api/dashboard');
@@ -1517,20 +2081,32 @@ async function loadEmployees() {
     } catch (e) { console.error(e); }
 }
 
+let _customerData = [];
+
 async function loadCustomers() {
     try {
         const resp = await api('/api/customers');
         const { data } = await resp.json();
-        const tbody = document.getElementById('customersBody');
-        if (!data || !data.length) { renderEmpty('customersBody', 5); return; }
-        tbody.innerHTML = data.map(c => `<tr>
-            <td>${c.id}</td>
-            <td><strong>${esc(c.name)}</strong></td>
-            <td>${esc(c.phone || '-')}</td>
-            <td>${esc(c.notes || '-')}</td>
-            <td>${c.created_at ? c.created_at.slice(0,10) : '-'}</td>
-        </tr>`).join('');
+        _customerData = data || [];
+        renderCustomerTable();
     } catch (e) { console.error(e); }
+}
+
+function renderCustomerTable() {
+    const tbody = document.getElementById('customersBody');
+    if (!_customerData.length) { renderEmpty('customersBody', 5); return; }
+    const kw = (document.getElementById('customerSearch')?.value || '').trim().toLowerCase();
+    const rows = kw
+        ? _customerData.filter(c => (c.name||'').toLowerCase().includes(kw) || (c.phone||'').includes(kw) || (c.notes||'').toLowerCase().includes(kw))
+        : _customerData;
+    if (!rows.length) { tbody.innerHTML = `<tr><td colspan="5" style="text-align:center;color:var(--text-secondary);padding:24px;">没有匹配的顾客</td></tr>`; return; }
+    tbody.innerHTML = rows.map(c => `<tr>
+        <td>${c.id}</td>
+        <td><strong>${esc(c.name)}</strong></td>
+        <td>${esc(c.phone || '-')}</td>
+        <td>${esc(c.notes || '-')}</td>
+        <td>${c.created_at ? c.created_at.slice(0,10) : '-'}</td>
+    </tr>`).join('');
 }
 
 async function loadServices() {
@@ -1590,24 +2166,75 @@ async function loadSales() {
     } catch (e) { console.error(e); }
 }
 
+let _memberData = [];
+
 async function loadMemberships() {
     try {
         const resp = await api('/api/memberships');
         const { data } = await resp.json();
-        const tbody = document.getElementById('membershipsBody');
-        if (!data || !data.length) { renderEmpty('membershipsBody', 9); return; }
-        tbody.innerHTML = data.map(m => `<tr>
+        _memberData = data || [];
+        renderMemberTable();
+        renderMemberAlert();
+    } catch (e) { console.error(e); }
+}
+
+function renderMemberTable() {
+    const tbody = document.getElementById('membershipsBody');
+    if (!_memberData.length) { renderEmpty('membershipsBody', 10); return; }
+    const kw = (document.getElementById('memberSearch')?.value || '').trim().toLowerCase();
+    const rows = kw
+        ? _memberData.filter(m => (m.customer_name || '').toLowerCase().includes(kw) || (m.card_type || '').toLowerCase().includes(kw))
+        : _memberData;
+    if (!rows.length) { tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;color:var(--text-secondary);padding:24px;">没有匹配的会员</td></tr>`; return; }
+    tbody.innerHTML = rows.map(m => {
+        const isSessionCard = m.remaining_sessions != null;
+        const ops = m.is_active ? `
+            <button class="btn-mini" onclick="quickMemberOp(${m.id}, '${esc(m.customer_name||'')}', '${esc(m.card_type||'')}', '${isSessionCard ? 'redeem' : 'deduct'}')">${isSessionCard ? '扣次' : '扣款'}</button>
+            <button class="btn-mini" onclick="quickMemberOp(${m.id}, '${esc(m.customer_name||'')}', '${esc(m.card_type||'')}', 'renew')">续卡</button>
+            <button class="btn-mini btn-mini-danger" onclick="quickMemberOp(${m.id}, '${esc(m.customer_name||'')}', '${esc(m.card_type||'')}', 'refund')">退卡</button>` : '-';
+        return `<tr>
             <td>${m.id}</td>
-            <td>${esc(m.customer_name || '-')}</td>
+            <td><strong>${esc(m.customer_name || '-')}</strong></td>
             <td>${esc(m.card_type || '-')}</td>
             <td>¥${(m.total_amount || 0).toLocaleString()}</td>
             <td>¥${(m.balance || 0).toLocaleString()}</td>
             <td>${m.remaining_sessions != null ? m.remaining_sessions : '-'}</td>
             <td>${m.points || 0}</td>
-            <td>${m.opened_at || '-'}</td>
+            <td>${m.expires_at || '-'}</td>
             <td>${m.is_active ? '<span class="badge badge-success">有效</span>' : '<span class="badge badge-danger">已过期</span>'}</td>
-        </tr>`).join('');
-    } catch (e) { console.error(e); }
+            <td>${ops}</td>
+        </tr>`;
+    }).join('');
+}
+
+function renderMemberAlert() {
+    const bar = document.getElementById('memberAlertBar');
+    const today = new Date(); today.setHours(0,0,0,0);
+    const soon = _memberData.filter(m => {
+        if (!m.is_active || !m.expires_at) return false;
+        const exp = new Date(m.expires_at + 'T00:00:00');
+        const days = Math.round((exp - today) / 86400000);
+        return days >= 0 && days <= 30;
+    });
+    if (soon.length) {
+        const totalBal = soon.reduce((s,m) => s + (m.balance||0), 0);
+        bar.style.display = 'block';
+        bar.innerHTML = `⏰ <strong>${soon.length} 张会员卡将在30天内到期</strong>，涉及余额 ¥${totalBal.toLocaleString()}：${soon.slice(0,5).map(m => `${esc(m.customer_name)}(${m.expires_at.slice(5)})`).join('、')}${soon.length>5?' 等':''}。可在AI店长说「查一下快到期的会员卡」安排召回。`;
+    } else { bar.style.display = 'none'; }
+}
+
+function quickMemberOp(id, name, cardType, op) {
+    const cmdMap = {
+        redeem: `帮${name}核销${cardType}卡（卡号${id}）扣1次`,
+        deduct: `从${name}的${cardType}卡（卡号${id}）扣款`,
+        renew: `给${name}的${cardType}卡（卡号${id}）续卡`,
+        refund: `给${name}办理退卡（卡号${id}），请说明退款规则`,
+    };
+    const msg = cmdMap[op];
+    switchPage('chat');
+    const input = document.getElementById('chatInput');
+    input.value = msg;
+    input.focus();
 }
 
 async function loadProducts() {
@@ -1627,7 +2254,127 @@ async function loadProducts() {
     } catch (e) { console.error(e); }
 }
 
-// ==================== 初始化 ====================
+// ==================== 知识库管理 ====================
+const kbCategoryLabels = {tuning:'🔊调频', faq:'❓FAQ', sop:'📋SOP', industry:'💡常识'};
+
+async function loadKnowledge() {
+    try {
+        // 加载统计
+        const statsResp = await api('/api/knowledge_base');
+        const statsData = await statsResp.json();
+        if (statsData.stats) {
+            const s = statsData.stats;
+            document.getElementById('kbStats').innerHTML =
+                Object.entries(kbCategoryLabels).map(([k, label]) =>
+                    `<div style="padding:8px 16px;background:var(--bg-secondary);border-radius:8px;border:1px solid var(--border-color);"><div style="font-size:12px;color:var(--text-secondary);">${label}</div><div style="font-size:24px;font-weight:700;">${s[k]||0}</div></div>`
+                ).join('') + `<div style="padding:8px 16px;background:var(--accent);border-radius:8px;color:#fff;"><div style="font-size:12px;">总计</div><div style="font-size:24px;font-weight:700;">${s.total||0}</div></div>`;
+        }
+
+        // 加载条目
+        const category = document.getElementById('kbCategory').value;
+        const searchQ = document.getElementById('kbSearch').value.trim();
+        let items = [];
+        if (searchQ) {
+            const resp = await api('/api/knowledge_base/search?q=' + encodeURIComponent(searchQ));
+            const data = await resp.json();
+            items = data.results || [];
+        } else {
+            const resp = await api('/api/knowledge_base/items' + (category ? '?category=' + category : ''));
+            const data = await resp.json();
+            items = data.items || [];
+        }
+
+        const tbody = document.getElementById('kbBody');
+        if (!items.length) { renderEmpty('kbBody', 6); return; }
+        tbody.innerHTML = items.map((item, i) => `<tr>
+            <td>${i+1}</td>
+            <td><span style="font-size:12px;padding:2px 8px;border-radius:4px;background:var(--bg-secondary);">${kbCategoryLabels[item.category]||item.category}</span></td>
+            <td><strong>${esc(item.question)}</strong></td>
+            <td style="font-size:12px;color:var(--text-secondary);">${(item.keywords||[]).map(k=>'<span style="padding:1px 6px;margin:1px;border-radius:3px;background:var(--bg-secondary);">'+esc(k)+'</span>').join(' ')}</td>
+            <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;">${esc(item.answer)}</td>
+            <td style="white-space:nowrap;">
+                <button onclick="showKbEditForm('${item.category}',${item.id})" class="btn-mini">编辑</button>
+                <button onclick="doKbDelete('${item.category}',${item.id})" class="btn-mini btn-mini-danger">删除</button>
+            </td>
+        </tr>`).join('');
+    } catch (e) { console.error(e); }
+}
+
+function showKbEditForm(category, id) {
+    // 复用新增表单做编辑：找到条目数据填充
+    const tr = event.target.closest('tr');
+    const cells = tr.querySelectorAll('td');
+    document.getElementById('kbAddForm').style.display = 'block';
+    document.getElementById('kbAddCategory').value = category;
+    document.getElementById('kbAddQuestion').value = cells[2].innerText.trim();
+    document.getElementById('kbAddKeywords').value = cells[3].innerText.trim().split(/\s+/).join(',');
+    document.getElementById('kbAddAnswer').value = cells[4].innerText.trim();
+    document.getElementById('kbAddFollowup').value = '';
+    document.getElementById('kbAddFormTitle').textContent = '✏️ 编辑条目';
+    document.getElementById('kbAddForm').dataset.editCategory = category;
+    document.getElementById('kbAddForm').dataset.editId = id;
+}
+
+async function doKbDelete(category, index) {
+    if (!confirm('确定删除这条知识库条目吗？')) return;
+    try {
+        const resp = await api('/api/knowledge_base/items?category='+category+'&index='+index, {method:'DELETE'});
+        const data = await resp.json();
+        if (data.success) { loadKnowledge(); } else { alert('删除失败'); }
+    } catch (e) { alert('删除出错: ' + e.message); }
+}
+
+function showKbAddForm() {
+    document.getElementById('kbAddForm').style.display = 'block';
+    document.getElementById('kbAddFormTitle').textContent = '➕ 新增条目';
+    delete document.getElementById('kbAddForm').dataset.editCategory;
+    delete document.getElementById('kbAddForm').dataset.editId;
+    document.getElementById('kbAddQuestion').value = '';
+    document.getElementById('kbAddKeywords').value = '';
+    document.getElementById('kbAddAnswer').value = '';
+    document.getElementById('kbAddFollowup').value = '';
+}
+
+async function doKbAdd() {
+    const form = document.getElementById('kbAddForm');
+    const editCategory = form.dataset.editCategory;
+    const editId = form.dataset.editId;
+    const category = document.getElementById('kbAddCategory').value;
+    const question = document.getElementById('kbAddQuestion').value.trim();
+    const keywordsStr = document.getElementById('kbAddKeywords').value.trim();
+    const answer = document.getElementById('kbAddAnswer').value.trim();
+    const followUp = document.getElementById('kbAddFollowup').value.trim();
+    if (!question || !keywordsStr || !answer) { alert('问题、关键词和回答不能为空'); return; }
+    const keywords = keywordsStr.split(/[,，]/).map(k=>k.trim()).filter(Boolean);
+    const item = {question, keywords, answer};
+    if (followUp) item.follow_up = followUp;
+    try {
+        if (editCategory && editId) {
+            // 编辑模式：删旧+加新（JSON顺序保持）
+            const delResp = await api('/api/knowledge_base/items?category='+editCategory+'&index='+editId, {method:'DELETE'});
+            const delData = await delResp.json();
+            if (!delData.success) { alert('编辑失败: 旧条目更新出错'); return; }
+        }
+        const resp = await api('/api/knowledge_base/items', {
+            method: 'POST',
+            body: JSON.stringify({category, item})
+        });
+        const data = await resp.json();
+        if (data.success) {
+            form.style.display = 'none';
+            loadKnowledge();
+        } else { alert('保存失败: ' + (data.error||'')); }
+    } catch (e) { alert('保存出错: ' + e.message); }
+}
+
+async function doKbDelete(category, index) {
+    if (!confirm('确定删除这条知识库条目吗？')) return;
+    try {
+        const resp = await api('/api/knowledge_base/items?category='+category+'&index='+index, {method:'DELETE'});
+        const data = await resp.json();
+        if (data.success) { loadKnowledge(); } else { alert('删除失败'); }
+    } catch (e) { alert('删除出错: ' + e.message); }
+}
 (async function init() {
     // 设置默认日期筛选
     const today = new Date().toISOString().slice(0, 10);

@@ -1,0 +1,31 @@
+services:
+  bizbot:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: bizbot
+    restart: unless-stopped
+    env_file: .env
+    # 只暴露给本机 nginx，不直接对公网
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - bizbot_data:/app/data
+      - bizbot_logs:/app/logs
+
+  nginx:
+    image: nginx:alpine
+    container_name: bizbot-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      - bizbot
+
+volumes:
+  bizbot_data:
+  bizbot_logs:
