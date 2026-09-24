@@ -1,0 +1,102 @@
+name: build-desktop-packages
+
+# 用途：云端自动打包 Windows exe + macOS 安装包（PyInstaller 不支持跨平台）
+# 触发：手动（Actions 页面点 Run workflow）或推送 v* 标签
+# 产物：Actions 运行页底部 Artifacts 下载 BizBot-windows.zip / BizBot-macos.zip
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: 安装依赖
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: 打包（单目录模式）
+        run: pyinstaller salon_assistant.spec --noconfirm
+
+      - name: 冒烟验证（exe 能启动且 API 就绪）
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem "dist/美业AI店长助手/美业AI店长助手.exe"
+          if (-not $exe) { throw "未找到打包产物" }
+          # 启动 exe 并等待 API 就绪（60s 内）
+          $p = Start-Process -FilePath $exe.FullName -ArgumentList "--port","18899","--username","smoke","--password","smoke123","--no-agent" -PassThru
+          $ok = $false
+          foreach ($i in 1..30) {
+            Start-Sleep -Seconds 2
+            try {
+              $r = Invoke-WebRequest -Uri "http://127.0.0.1:18899/api/health" -UseBasicParsing -TimeoutSec 3
+              if ($r.StatusCode -eq 200) { $ok = $true; break }
+            } catch {}
+          }
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          if (-not $ok) { throw "exe 启动后 API 未就绪" }
+          Write-Host "✓ exe 冒烟通过"
+
+      - name: 压缩产物
+        shell: pwsh
+        run: Compress-Archive -Path "dist/美业AI店长助手" -DestinationPath "BizBot-windows.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BizBot-windows
+          path: BizBot-windows.zip
+          retention-days: 30
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: 安装依赖
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: 打包（单目录 .app）
+        run: pyinstaller salon_assistant.spec --noconfirm
+
+      - name: 冒烟验证（可执行文件能启动且 API 就绪）
+        run: |
+          BIN="dist/美业AI店长助手/美业AI店长助手"
+          [ -f "$BIN" ] || BIN=$(find dist -type f -perm +111 | grep -v "\.so" | head -1)
+          [ -n "$BIN" ] || { echo "未找到打包产物"; exit 1; }
+          "$BIN" --port 18899 --username smoke --password smoke123 --no-agent &
+          PID=$!
+          OK=0
+          for i in $(seq 1 30); do
+            sleep 2
+            if curl -sf http://127.0.0.1:18899/api/health >/dev/null 2>&1; then OK=1; break; fi
+          done
+          kill $PID 2>/dev/null || true
+          [ "$OK" = "1" ] || { echo "启动后 API 未就绪"; exit 1; }
+          echo "✓ macOS 冒烟通过"
+
+      - name: 压缩产物（含双击启动器）
+        run: |
+          cp deploy/启动店长助手.command "dist/美业AI店长助手/启动店长助手.command" || true
+          cd dist && zip -qry "BizBot-macos.zip" "美业AI店长助手" && cd ..
+          ls -lh BizBot-macos.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BizBot-macos
+          path: BizBot-macos.zip
+          retention-days: 30
