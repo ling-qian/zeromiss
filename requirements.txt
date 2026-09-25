@@ -5,6 +5,8 @@ pydantic-settings>=2.0.0
 
 # Database
 sqlalchemy>=2.0.0
+greenlet>=3.0  # SQLAlchemy 异步模式必需；PyInstaller 隐藏依赖
+appdirs>=1.4.4  # pkg_resources 运行时钩子需要；PyInstaller 隐藏依赖
 alembic>=1.12.0
 
 # LLM APIs (MiniMax 通过 anthropic SDK 兼容接口调用)
