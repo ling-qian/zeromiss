@@ -31,11 +31,11 @@ jobs:
         shell: pwsh
         run: |
           $exe = Get-ChildItem "dist/BizBot/BizBot.exe"
-          if (-not $exe) { throw "未找到打包产物" }
-          # 启动 exe 并等待 API 就绪（60s 内）
-          $p = Start-Process -FilePath $exe.FullName -ArgumentList "--port","18899","--username","smoke","--password","smoke123","--no-agent" -PassThru
+          if (-not $exe) { throw "artifact not found: dist/BizBot/BizBot.exe" }
+          # 启动 exe 并等待 API 就绪（120s 窗口，Windows Defender 首扫 517M 文件较慢）
+          $p = Start-Process -FilePath $exe.FullName -ArgumentList "--port","18899","--username","smoke","--password","smoke123","--no-agent" -PassThru -RedirectStandardOutput smoke_out.log -RedirectStandardError smoke_err.log
           $ok = $false
-          foreach ($i in 1..30) {
+          foreach ($i in 1..60) {
             Start-Sleep -Seconds 2
             try {
               $r = Invoke-WebRequest -Uri "http://127.0.0.1:18899/health" -UseBasicParsing -TimeoutSec 3
@@ -43,8 +43,14 @@ jobs:
             } catch {}
           }
           Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-          if (-not $ok) { throw "exe 启动后 API 未就绪" }
-          Write-Host "✓ exe 冒烟通过"
+          if (-not $ok) {
+            Write-Host "=== exe stdout (last 40 lines) ==="
+            Get-Content smoke_out.log -ErrorAction SilentlyContinue | Select-Object -Last 40
+            Write-Host "=== exe stderr (last 40 lines) ==="
+            Get-Content smoke_err.log -ErrorAction SilentlyContinue | Select-Object -Last 40
+            throw "exe started but API not ready in 120s"
+          }
+          Write-Host "OK: windows smoke passed"
 
       - name: 压缩产物
         shell: pwsh
@@ -102,7 +108,7 @@ jobs:
       - name: 压缩产物（含双击启动器）
         run: |
           cp deploy/启动店长助手.command "dist/BizBot/启动店长助手.command" || true
-          cd dist && zip -qry "BizBot-macos.zip" "美业AI店长助手" && cd ..
+          cd dist && zip -qry "BizBot-macos.zip" "BizBot" && cd ..
           ls -lh BizBot-macos.zip
 
       - uses: actions/upload-artifact@v4
