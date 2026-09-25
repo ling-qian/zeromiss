@@ -181,7 +181,8 @@ async def main():
                         help="不启动 Agent（仅数据库可视化）")
     parser.add_argument("--skip-init-data", action="store_true",
                         help="跳过默认业务数据初始化")
-    args = parser.parse_args()
+    # parse_known_args：忽略 PyInstaller/macOS 冻结环境下 multiprocessing 注入的引导参数
+    args, _unknown = parser.parse_known_args()
 
     # ==================== 日志文件输出 ====================
     # stderr 保留控制台输出；文件日志供门店部署后排查问题
