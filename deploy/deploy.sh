@@ -19,7 +19,7 @@ docker compose up -d --build
 
 echo "-- 健康检查（最多等 30s）"
 for i in $(seq 1 15); do
-  if curl -sf http://127.0.0.1:8080/api/health >/dev/null 2>&1; then
+  if curl -sf http://127.0.0.1:8080/health >/dev/null 2>&1; then
     echo "✓ 应用已启动"
     echo "✓ 对外入口: https://你的域名  |  企微回调地址: https://你的域名/wecom/kf/callback"
     echo ""
