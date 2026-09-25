@@ -30,7 +30,7 @@ jobs:
       - name: 冒烟验证（exe 能启动且 API 就绪）
         shell: pwsh
         run: |
-          $exe = Get-ChildItem "dist/美业AI店长助手/美业AI店长助手.exe"
+          $exe = Get-ChildItem "dist/BizBot/BizBot.exe"
           if (-not $exe) { throw "未找到打包产物" }
           # 启动 exe 并等待 API 就绪（60s 内）
           $p = Start-Process -FilePath $exe.FullName -ArgumentList "--port","18899","--username","smoke","--password","smoke123","--no-agent" -PassThru
@@ -48,7 +48,7 @@ jobs:
 
       - name: 压缩产物
         shell: pwsh
-        run: Compress-Archive -Path "dist/美业AI店长助手" -DestinationPath "BizBot-windows.zip"
+        run: Compress-Archive -Path "dist/BizBot" -DestinationPath "BizBot-windows.zip"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -75,7 +75,7 @@ jobs:
 
       - name: 冒烟验证（可执行文件能启动且 API 就绪）
         run: |
-          BIN="dist/美业AI店长助手/美业AI店长助手"
+          BIN="dist/BizBot/BizBot"
           [ -f "$BIN" ] || BIN=$(find dist -type f -perm +111 | grep -v "\.so" | head -1)
           [ -n "$BIN" ] || { echo "未找到打包产物"; exit 1; }
           "$BIN" --port 18899 --username smoke --password smoke123 --no-agent &
@@ -91,17 +91,17 @@ jobs:
 
       - name: Ad-hoc 签名（免费；2026新规：无签名结构的可执行文件会被Gatekeeper判"已损坏"）
         run: |
-          codesign --force --deep --sign - "dist/美业AI店长助手" 2>/dev/null || \
+          codesign --force --deep --sign - "dist/BizBot" 2>/dev/null || \
           find dist -name "*.app" -exec codesign --force --deep --sign - {} \; || true
 
       - name: 制作 .dmg 安装镜像
         run: |
-          hdiutil create -volname "BizBot AI店长助手" -srcfolder "dist/美业AI店长助手" -ov -format UDZO BizBot-macos.dmg
+          hdiutil create -volname "BizBot AI店长助手" -srcfolder "dist/BizBot" -ov -format UDZO BizBot-macos.dmg
           ls -lh BizBot-macos.dmg
 
       - name: 压缩产物（含双击启动器）
         run: |
-          cp deploy/启动店长助手.command "dist/美业AI店长助手/启动店长助手.command" || true
+          cp deploy/启动店长助手.command "dist/BizBot/启动店长助手.command" || true
           cd dist && zip -qry "BizBot-macos.zip" "美业AI店长助手" && cd ..
           ls -lh BizBot-macos.zip
 

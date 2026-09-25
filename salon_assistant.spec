@@ -70,7 +70,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,  # onedir 模式：二进制交给 COLLECT，启动快、无解压等待
-    name='美业AI店长助手',
+    name='BizBot',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -93,5 +93,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name='美业AI店长助手',
+    name='BizBot',
 )
