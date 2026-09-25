@@ -108,7 +108,7 @@ jobs:
       - name: 压缩产物（含双击启动器）
         run: |
           cp deploy/启动店长助手.command "dist/BizBot/启动店长助手.command" || true
-          cd dist && zip -qry "BizBot-macos.zip" "BizBot" && cd ..
+          cd dist && zip -qry "../BizBot-macos.zip" "BizBot" && cd ..
           ls -lh BizBot-macos.zip
 
       - uses: actions/upload-artifact@v4

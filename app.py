@@ -464,6 +464,13 @@ async def main():
 if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()  # PyInstaller 冻结环境必需：缺失时 spawn 子进程会重跑 main() 导致多实例抢端口
+    # Windows 重定向输出时代码页是 cp1252，emoji/中文 print 会炸进程；强制 UTF-8 + 替换不可编码字符
+    for _stream in (sys.stdout, sys.stderr):
+        if _stream is not None and hasattr(_stream, "reconfigure"):
+            try:
+                _stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
