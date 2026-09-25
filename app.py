@@ -448,8 +448,14 @@ async def main():
             shutdown_event.set()
 
         # 使用 loop.add_signal_handler（asyncio 原生方式，确保事件循环能正确唤醒）
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, signal_handler, sig)
+        # Windows 的 asyncio 不支持 add_signal_handler（会抛 NotImplementedError 导致启动即退）：
+        # Windows 下 Ctrl+C 走默认 KeyboardInterrupt 路径（except KeyboardInterrupt 已处理），
+        # 外部终止走 Stop-Process 强杀，不影响正常退出流程
+        if sys.platform != "win32":
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, signal_handler, sig)
+        else:
+            logger.info("Windows 平台：退出走 Ctrl+C (KeyboardInterrupt) 或外部进程终止")
 
         # 保持运行，直到收到退出信号
         await shutdown_event.wait()
