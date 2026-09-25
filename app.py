@@ -24,6 +24,7 @@ import asyncio
 import os
 import signal
 import sys
+import threading
 
 from loguru import logger
 
@@ -471,6 +472,14 @@ if __name__ == "__main__":
                 _stream.reconfigure(encoding="utf-8", errors="replace")
             except Exception:
                 pass
+
+    def _thread_excepthook(args):
+        import traceback as _tb
+        print(f"[diag] thread {args.thread.name} died: {args.exc_type.__name__}: {args.exc_value}", file=sys.stderr, flush=True)
+        if args.exc_traceback:
+            _tb.print_exception(args.exc_type, args.exc_value, args.exc_traceback, file=sys.stderr)
+
+    threading.excepthook = _thread_excepthook  # 冻结环境 daemon 线程静默死亡时强制现形
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):

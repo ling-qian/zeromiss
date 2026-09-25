@@ -816,11 +816,32 @@ class WebChannel(Channel):
             self._server_loop = loop
 
             # 创建 uvicorn 配置，禁用 uvicorn 自身的信号处理
+            # uvicorn 日志显式接到 stderr（冻结环境下默认 logging 可能被吞，bind/lifespan 状态必须可见）
+            _uv_log = {
+                "version": 1,
+                "disable_existing_loggers": False,
+                "formatters": {
+                    "plain": {"format": "%(levelname)s [uvicorn] %(message)s"}
+                },
+                "handlers": {
+                    "stderr": {
+                        "class": "logging.StreamHandler",
+                        "stream": "ext://sys.stderr",
+                        "formatter": "plain",
+                    }
+                },
+                "loggers": {
+                    "uvicorn": {"handlers": ["stderr"], "level": "INFO", "propagate": False},
+                    "uvicorn.error": {"level": "INFO"},
+                    "uvicorn.access": {"handlers": ["stderr"], "level": "WARNING", "propagate": False},
+                },
+            }
             config = uvicorn.Config(
                 self.app,
                 host=self.host,
                 port=self.port,
-                log_level="warning",
+                log_level="info",
+                log_config=_uv_log,
                 loop="asyncio",
             )
 
@@ -830,10 +851,17 @@ class WebChannel(Channel):
             self._server.install_signal_handlers = lambda: None
 
             try:
-                # 运行服务器
-                loop.run_until_complete(self._server.serve())
-            except Exception as e:
-                logger.error(f"服务器运行出错: {e}")
+                # 运行服务器（捕获返回值：False=lifespan 启动失败，正常阻塞运行中不会返回）
+                ret = loop.run_until_complete(self._server.serve())
+                logger.error(
+                    f"[diag] uvicorn serve 已返回: ret={ret}, "
+                    f"should_exit={getattr(self._server, 'should_exit', '?')}, "
+                    f"started={getattr(self._server, 'started', '?')}"
+                )
+            except BaseException as e:
+                logger.error(f"服务器运行出错: {type(e).__name__}: {e}")
+                import traceback
+                traceback.print_exc()
             finally:
                 # 清理事件循环中的待处理任务
                 try:
