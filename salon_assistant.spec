@@ -16,6 +16,7 @@ block_cipher = None
 
 # 收集所有隐式依赖
 hiddenimports = [
+    'greenlet',  # SQLAlchemy 2.x 异步模式必需，动态加载 PyInstaller 扫不到
     'sqlalchemy.dialects.sqlite',
     'sqlalchemy.orm',
     'sqlalchemy.sql',
