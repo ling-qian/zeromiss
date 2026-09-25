@@ -34,27 +34,25 @@ jobs:
           if (-not $exe) { throw "artifact not found: dist/BizBot/BizBot.exe" }
           # 启动 exe 并等待 API 就绪（120s 窗口，Windows Defender 首扫 517M 文件较慢）
           $p = Start-Process -FilePath $exe.FullName -ArgumentList "--port","18899","--username","smoke","--password","smoke123","--no-agent" -PassThru -RedirectStandardOutput smoke_out.log -RedirectStandardError smoke_err.log
+          # Defender 首扫 517M onedir 可能拖慢进程启动 3-5 分钟，窗口给足 10 分钟
           $ok = $false
-          foreach ($i in 1..90) {
+          foreach ($i in 1..300) {
             Start-Sleep -Seconds 2
             curl.exe -s -f http://127.0.0.1:18899/health 2>$null
             if ($LASTEXITCODE -eq 0) { $ok = $true; break }
             if ($i % 15 -eq 0) {
-              $tcp = New-Object Net.Sockets.TcpClient
-              try { $tcpOk = $tcp.ConnectAsync("127.0.0.1", 18899).Wait(800) } catch { $tcpOk = $false }
-              $tcp.Close()
-              Write-Host "probe[$i]: curl_exit=$LASTEXITCODE tcp_connect=$tcpOk"
+              Write-Host "probe[$i]: curl_exit=$LASTEXITCODE at $(Get-Date -Format 'HH:mm:ss')"
             }
           }
-          Write-Host "=== netstat :18899 (process still alive) ==="
-          netstat -ano | Select-String 18899
+          Write-Host "=== Get-NetTCPConnection :18899 (before kill) ==="
+          Get-NetTCPConnection -LocalPort 18899 -ErrorAction SilentlyContinue | Format-Table -AutoSize | Out-String
           Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
           if (-not $ok) {
             Write-Host "=== exe stdout (last 40 lines) ==="
             Get-Content smoke_out.log -ErrorAction SilentlyContinue | Select-Object -Last 40
             Write-Host "=== exe stderr (last 40 lines) ==="
             Get-Content smoke_err.log -ErrorAction SilentlyContinue | Select-Object -Last 40
-            throw "exe started but API not ready in 180s"
+            throw "exe started but API not ready in 600s"
           }
           Write-Host "OK: windows smoke passed"
 
