@@ -22,6 +22,10 @@ from database import DatabaseManager
 from database.models import ServiceRecord, Membership, ProductSale
 
 # 导入业务函数
+# examples/ 目录已随美业转型移除（gym_agent_manager 是健身房遗留示例），
+# 模块缺失时跳过整个文件，避免 CI collection error
+if not (project_root / "examples" / "gym_agent_manager.py").exists():
+    pytest.skip("examples/gym_agent_manager.py 已随美业转型移除", allow_module_level=True)
 sys.path.insert(0, str(project_root / "examples"))
 from gym_agent_manager import (
     record_service_income,

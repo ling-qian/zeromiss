@@ -279,6 +279,8 @@ class WeChatChannel(Channel):
 
     def _register_routes(self):
         """注册 FastAPI 路由"""
+        from fastapi.responses import PlainTextResponse
+
         app = self._app
 
         @app.get("/wechat/verify")

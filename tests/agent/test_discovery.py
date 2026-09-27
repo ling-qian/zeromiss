@@ -109,9 +109,7 @@ class TestRegisterInstanceMethods:
             function_registry, test_service, prefix="svc_"
         )
         ex = ToolExecutor(function_registry)
-        result = asyncio.get_event_loop().run_until_complete(
-            ex.execute("svc_get_info", {})
-        )
+        result = asyncio.run(ex.execute("svc_get_info", {}))
         assert result == {"name": "test_service", "type": "service"}
 
 
@@ -174,9 +172,7 @@ class TestRegisterClassMethods:
         )
         assert function_registry.has_function("cls_get_info")
         ex = ToolExecutor(function_registry)
-        result = asyncio.get_event_loop().run_until_complete(
-            ex.execute("cls_get_info", {})
-        )
+        result = asyncio.run(ex.execute("cls_get_info", {}))
         assert result["name"] == "test_service"
 
     def test_without_instance(self, function_registry):

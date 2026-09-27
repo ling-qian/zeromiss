@@ -21,7 +21,7 @@ class TestHairSalonScenario:
         meituan = temp_db.channels.get_or_create(
             "美团", "platform", commission_rate=15.0
         )
-        temp_db.staff.get_or_create("Tony", "tony_hair")
+        temp_db.staff.get_or_create("Tony")
 
         # Save raw message
         msg_id = temp_db.save_raw_message({
@@ -143,7 +143,7 @@ class TestGymScenario:
     def test_member_training_and_product_sale(self, temp_db):
         """Full gym flow: membership → training → product sale."""
         # Setup
-        trainer = temp_db.staff.get_or_create("Coach Li", "coach_li")
+        trainer = temp_db.staff.get_or_create("Coach Li")
         channel = temp_db.channels.get_or_create(
             "Coach Li", "internal", commission_rate=40.0
         )
