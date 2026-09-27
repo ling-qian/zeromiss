@@ -44,11 +44,13 @@ from database.models import (
 # MiniMax API 配置
 # ================================================================
 
-MINIMAX_API_KEY = os.getenv(
-    "MINIMAX_API_KEY",
-    "sk-api-5f9qnjoJN8Ocha9Y4uyLkTW1s8aLUi4H5BqUm9htaW46_Qrx1GYlpGBFpu5wkmdjSdftmQjgff99iQ_sK8UFBrEnQ8eLiLBXLjxHyklQwyy1loOMOr4OOIo"
-)
+MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "")
 MINIMAX_MODEL = os.getenv("MINIMAX_MODEL", "MiniMax-M2.5")
+
+# 健身房遗留集成测试：需要真实 MINIMAX_API_KEY 才有意义；
+# 未配置时整体跳过（美业转型后 examples 场景已移除，硬编码默认 key 已清除）
+if not MINIMAX_API_KEY:
+    pytest.skip("未配置 MINIMAX_API_KEY，健身房集成测试整体跳过", allow_module_level=True)
 
 skip_no_key = pytest.mark.skipif(
     not MINIMAX_API_KEY,
